@@ -84,10 +84,17 @@ fn get_proxy_port() -> u16 {
 ///   传入 None 或空字符串表示直连
 pub fn init(proxy_url: Option<&str>) -> Result<(), String> {
     let effective_url = proxy_url.filter(|s| !s.trim().is_empty());
+    // 与 apply_proxy 相同：先捕获快照再构建，构建期间的变化留待下一轮
+    // 刷新检测，不会把旧配置的 Client 标记成新配置。
+    let baked = if effective_url.is_some() {
+        None
+    } else {
+        Some(read_system_proxy_snapshot())
+    };
     let client = build_client(effective_url)?;
 
     // 尝试初始化全局客户端，如果已存在则记录警告并使用 apply_proxy 更新
-    if GLOBAL_CLIENT.set(RwLock::new(client.clone())).is_err() {
+    if GLOBAL_CLIENT.set(RwLock::new(client)).is_err() {
         log::warn!(
             "[GlobalProxy] [GP-003] Already initialized, updating instead: {}",
             effective_url
@@ -98,14 +105,10 @@ pub fn init(proxy_url: Option<&str>) -> Result<(), String> {
         return apply_proxy(proxy_url);
     }
 
-    // 初始化代理 URL 记录
+    // 初始化代理 URL 记录（OnceCell 首次写入，无并发切换窗口）
     let _ = CURRENT_PROXY_URL.set(RwLock::new(effective_url.map(|s| s.to_string())));
     STATE_GENERATION.fetch_add(1, Ordering::AcqRel);
-    store_baked_system_snapshot(if effective_url.is_some() {
-        None
-    } else {
-        Some(read_system_proxy_snapshot())
-    });
+    store_baked_system_snapshot(baked);
 
     log::info!(
         "[GlobalProxy] Initialized: {}",
@@ -143,36 +146,38 @@ pub fn validate_proxy(proxy_url: Option<&str>) -> Result<(), String> {
 /// * `proxy_url` - 代理 URL，None 或空字符串表示直连
 pub fn apply_proxy(proxy_url: Option<&str>) -> Result<(), String> {
     let effective_url = proxy_url.filter(|s| !s.trim().is_empty());
+    // 先捕获快照再构建：若构建期间系统代理恰好变化，最多造成一次可检测的
+    // snapshot mismatch，下一轮刷新自动修正；反过来（先构建后读快照）会把
+    // 旧配置的 Client 标记成新配置，之后永远检测不到差异。
+    let baked = if effective_url.is_some() {
+        None
+    } else {
+        Some(read_system_proxy_snapshot())
+    };
     let new_client = build_client(effective_url)?;
 
-    // 更新客户端
+    // Client、CURRENT_PROXY_URL、snapshot 三份状态在同一个 GLOBAL_CLIENT
+    // 写锁临界区内切换（锁序与 commit_system_refresh 一致：
+    // GLOBAL_CLIENT → CURRENT_PROXY_URL → snapshot）。自动刷新的提交同样
+    // 需要先取得该写锁，无法插入到切换中间造成"记录为显式、Client 却跟随
+    // 系统"的错位；代数递增也放在临界区内，供已过期的刷新提交复核。
     if let Some(lock) = GLOBAL_CLIENT.get() {
-        // 先递增代数再写入：自动刷新若在此期间提交，会因代数不匹配而放弃，
-        // 不会覆盖刚应用的显式代理。
-        STATE_GENERATION.fetch_add(1, Ordering::AcqRel);
         let mut client = lock.write().map_err(|e| {
             log::error!("[GlobalProxy] [GP-001] Failed to acquire write lock: {e}");
             "Failed to update proxy: lock poisoned".to_string()
         })?;
+        STATE_GENERATION.fetch_add(1, Ordering::AcqRel);
         *client = new_client;
+        if let Some(url_lock) = CURRENT_PROXY_URL.get() {
+            if let Ok(mut url) = url_lock.write() {
+                *url = effective_url.map(|s| s.to_string());
+            }
+        }
+        store_baked_system_snapshot(baked);
     } else {
         // 如果还没初始化，则初始化
         return init(proxy_url);
     }
-
-    // 更新代理 URL 记录
-    if let Some(lock) = CURRENT_PROXY_URL.get() {
-        let mut url = lock.write().map_err(|e| {
-            log::error!("[GlobalProxy] [GP-002] Failed to acquire URL write lock: {e}");
-            "Failed to update proxy URL record: lock poisoned".to_string()
-        })?;
-        *url = effective_url.map(|s| s.to_string());
-    }
-    store_baked_system_snapshot(if effective_url.is_some() {
-        None
-    } else {
-        Some(read_system_proxy_snapshot())
-    });
 
     log::info!(
         "[GlobalProxy] Applied: {}",
@@ -195,34 +200,32 @@ pub fn apply_proxy(proxy_url: Option<&str>) -> Result<(), String> {
 #[allow(dead_code)]
 pub fn update_proxy(proxy_url: Option<&str>) -> Result<(), String> {
     let effective_url = proxy_url.filter(|s| !s.trim().is_empty());
+    let baked = if effective_url.is_some() {
+        None
+    } else {
+        Some(read_system_proxy_snapshot())
+    };
     let new_client = build_client(effective_url)?;
 
-    // 更新客户端
+    // 与 apply_proxy 相同：三份状态在同一个 GLOBAL_CLIENT 写锁临界区内
+    // 切换，锁序与 commit_system_refresh 一致，刷新无法插入切换中间。
     if let Some(lock) = GLOBAL_CLIENT.get() {
-        STATE_GENERATION.fetch_add(1, Ordering::AcqRel);
         let mut client = lock.write().map_err(|e| {
             log::error!("[GlobalProxy] [GP-001] Failed to acquire write lock: {e}");
             "Failed to update proxy: lock poisoned".to_string()
         })?;
+        STATE_GENERATION.fetch_add(1, Ordering::AcqRel);
         *client = new_client;
+        if let Some(url_lock) = CURRENT_PROXY_URL.get() {
+            if let Ok(mut url) = url_lock.write() {
+                *url = effective_url.map(|s| s.to_string());
+            }
+        }
+        store_baked_system_snapshot(baked);
     } else {
         // 如果还没初始化，则初始化
         return init(proxy_url);
     }
-
-    // 更新代理 URL 记录
-    if let Some(lock) = CURRENT_PROXY_URL.get() {
-        let mut url = lock.write().map_err(|e| {
-            log::error!("[GlobalProxy] [GP-002] Failed to acquire URL write lock: {e}");
-            "Failed to update proxy URL record: lock poisoned".to_string()
-        })?;
-        *url = effective_url.map(|s| s.to_string());
-    }
-    store_baked_system_snapshot(if effective_url.is_some() {
-        None
-    } else {
-        Some(read_system_proxy_snapshot())
-    });
 
     log::info!(
         "[GlobalProxy] Updated: {}",
@@ -344,6 +347,11 @@ fn refresh_system_proxy_if_changed() {
 /// 提交前在写锁内校验：显式代理仍为空、状态代数未变、烘焙快照仍是检测时
 /// 的那份。任一不满足即放弃（例如用户在检测期间应用了显式代理，或另一路
 /// 刷新已经提交过），防止自动刷新覆盖用户设置或造成新旧状态错位。
+///
+/// 锁序契约：所有同时触碰 GLOBAL_CLIENT 与其余状态的路径（本函数与
+/// init/apply_proxy/update_proxy）都必须按 GLOBAL_CLIENT → CURRENT_PROXY_URL
+/// → BAKED_SYSTEM_SNAPSHOT 的顺序嵌套加锁，保证三份状态在同一个
+/// GLOBAL_CLIENT 写锁临界区内切换，刷新无法观察到"半切换"状态。
 fn commit_system_refresh(
     candidate: Client,
     seen_generation: u64,
