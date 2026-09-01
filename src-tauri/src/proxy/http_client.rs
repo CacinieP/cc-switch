@@ -24,6 +24,9 @@ static CC_SWITCH_PROXY_PORT: OnceCell<RwLock<u16>> = OnceCell::new();
 /// 显式用户代理生效时该值无意义（刷新逻辑会让位于用户设置）。
 static BAKED_SYSTEM_PROXY: OnceCell<RwLock<Option<String>>> = OnceCell::new();
 
+/// 客户端因系统代理变化而重建的次数（诊断与回归测试用）
+static SYSTEM_PROXY_REBUILD_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// 上次检查系统代理变化的时间戳（毫秒），用于节流
 static LAST_SYSTEM_PROXY_CHECK_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -201,16 +204,32 @@ pub fn update_proxy(proxy_url: Option<&str>) -> Result<(), String> {
 /// 未配置显式代理时（macOS），会节流地检测系统代理变化并按需重建客户端，
 /// 避免应用启动后系统代理关闭/切换导致请求持续打到失效代理上。
 pub fn get() -> Client {
-    if let Some(client) = GLOBAL_CLIENT
+    // 先做节流的变化检测再取客户端：若系统代理已变化，本次调用就直接拿到
+    // 重建后的客户端，而不是把旧客户端（可能仍指向失效代理）多返回一次。
+    refresh_system_proxy_if_changed();
+
+    GLOBAL_CLIENT
         .get()
         .and_then(|lock| lock.read().ok())
         .map(|c| c.clone())
-    {
-        refresh_system_proxy_if_changed();
-        return client;
+        .unwrap_or_else(|| {
+            log::warn!("[GlobalProxy] [GP-004] Client not initialized, using fallback");
+            build_client(None).unwrap_or_default()
+        })
+}
+
+/// 写入"当前客户端所采用的系统代理解析结果"快照（未初始化则初始化）
+fn store_baked_system_proxy(baked: Option<String>) {
+    match BAKED_SYSTEM_PROXY.get() {
+        Some(lock) => {
+            if let Ok(mut baked_lock) = lock.write() {
+                *baked_lock = baked;
+            }
+        }
+        None => {
+            let _ = BAKED_SYSTEM_PROXY.set(RwLock::new(baked));
+        }
     }
-    log::warn!("[GlobalProxy] [GP-004] Client not initialized, using fallback");
-    build_client(None).unwrap_or_default()
 }
 
 /// 记录当前全局客户端所采用的系统代理解析结果
@@ -222,11 +241,7 @@ fn record_baked_system_proxy(explicit_url: Option<&str>) {
     } else {
         current_effective_system_proxy()
     };
-    if let Some(lock) = BAKED_SYSTEM_PROXY.get() {
-        if let Ok(mut baked_lock) = lock.write() {
-            *baked_lock = baked;
-        }
-    }
+    store_baked_system_proxy(baked);
 }
 
 /// 节流地检查"跟随系统代理"的解析结果是否变化，变化则重建全局客户端
@@ -252,8 +267,7 @@ fn refresh_system_proxy_if_changed() {
     let baked = BAKED_SYSTEM_PROXY
         .get()
         .and_then(|lock| lock.read().ok())
-        .map(|b| b.clone())
-        .unwrap_or_default();
+        .and_then(|b| b.clone());
     if current == baked {
         return;
     }
@@ -264,11 +278,8 @@ fn refresh_system_proxy_if_changed() {
             if let Some(lock) = GLOBAL_CLIENT.get() {
                 if let Ok(mut client) = lock.write() {
                     *client = new_client;
-                    if let Some(baked_lock) = BAKED_SYSTEM_PROXY.get() {
-                        if let Ok(mut baked) = baked_lock.write() {
-                            *baked = current.clone();
-                        }
-                    }
+                    store_baked_system_proxy(current.clone());
+                    SYSTEM_PROXY_REBUILD_COUNT.fetch_add(1, Ordering::Relaxed);
                     log::info!(
                         "[GlobalProxy] System proxy changed, rebuilt client: {}",
                         current
@@ -283,6 +294,16 @@ fn refresh_system_proxy_if_changed() {
             log::warn!("[GlobalProxy] Failed to rebuild client after system proxy change: {e}")
         }
     }
+}
+
+#[cfg(test)]
+fn system_proxy_rebuild_count() -> u64 {
+    SYSTEM_PROXY_REBUILD_COUNT.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn reset_system_proxy_check_throttle() {
+    LAST_SYSTEM_PROXY_CHECK_MS.store(0, Ordering::Relaxed);
 }
 
 /// 原始解析"跟随系统代理"的目标：环境变量 → macOS 系统代理（不做存活判定）
@@ -807,5 +828,90 @@ mod tests {
         for key in &keys {
             std::env::remove_var(key);
         }
+    }
+
+    /// 初始化全局客户端并强制刷新系统代理快照（消除 init 路径差异）
+    fn setup_global_client_with_current_snapshot() {
+        if GLOBAL_CLIENT.get().is_none() {
+            let _ = init(None);
+        }
+        record_baked_system_proxy(None);
+    }
+
+    fn clear_proxy_env() {
+        for key in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_no_rebuild_when_system_proxy_unchanged() {
+        let _guard = env_lock().lock().unwrap();
+        clear_proxy_env();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::env::set_var("HTTPS_PROXY", &format!("http://127.0.0.1:{port}"));
+
+        setup_global_client_with_current_snapshot();
+        let before = system_proxy_rebuild_count();
+
+        // 代理解析结果未变化：多次触发检测都不应重建客户端
+        // （回归防护：若快照未正确写入/读取，这里每次都会误判为变化）
+        for _ in 0..3 {
+            reset_system_proxy_check_throttle();
+            refresh_system_proxy_if_changed();
+            assert_eq!(
+                system_proxy_rebuild_count(),
+                before,
+                "unchanged system proxy must not trigger client rebuild"
+            );
+        }
+
+        clear_proxy_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_rebuild_once_when_system_proxy_dies() {
+        let _guard = env_lock().lock().unwrap();
+        clear_proxy_env();
+
+        // 代理存活时初始化快照，随后关掉监听模拟代理工具退出
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::env::set_var("HTTPS_PROXY", &format!("http://127.0.0.1:{port}"));
+
+        setup_global_client_with_current_snapshot();
+        let before = system_proxy_rebuild_count();
+
+        drop(listener);
+        reset_system_proxy_check_throttle();
+        refresh_system_proxy_if_changed();
+        let after_death = system_proxy_rebuild_count();
+        assert_eq!(
+            after_death,
+            before + 1,
+            "system proxy dying must trigger exactly one rebuild"
+        );
+
+        // 代理保持死亡：后续检测不应再次重建
+        reset_system_proxy_check_throttle();
+        refresh_system_proxy_if_changed();
+        assert_eq!(
+            system_proxy_rebuild_count(),
+            after_death,
+            "keep-direct state must not rebuild repeatedly"
+        );
+
+        clear_proxy_env();
     }
 }
