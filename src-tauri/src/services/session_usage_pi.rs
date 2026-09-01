@@ -2,6 +2,11 @@
 //!
 //! Pi records normalized token and cost data in its session JSONL files. This
 //! importer keeps direct (non-proxy) Pi usage visible in the shared dashboard.
+//!
+//! Providers whose `models.json` `baseUrl` points at CC Switch's own local
+//! gateway are excluded: the gateway already logs those requests with
+//! `data_source = "proxy"`, so importing them again would double-count every
+//! call in the dashboard.
 
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
@@ -15,8 +20,10 @@ use crate::services::usage_stats::find_model_pricing;
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -137,6 +144,103 @@ pub fn sync_pi_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
     Ok(sync_pi_files(db, &files))
 }
 
+/// 收集 baseUrl 指向 CC Switch 本地网关的 Pi provider 键。
+///
+/// 这些请求已经由网关以 `data_source = "proxy"` 记账，会话导入必须跳过，
+/// 否则同一笔调用在仪表盘里被计两次（#6794）。
+///
+/// - 端口必须等于网关监听端口（`proxy_config` 三行互为镜像，读 claude 行）；
+/// - 主机是回环地址或等于监听地址即视为指向本机网关；
+/// - `enable_logging` 关闭时网关不落用量行，此时 pi_session 是唯一记录，
+///   不做过滤。
+fn proxy_routed_pi_provider_keys(conn: &rusqlite::Connection) -> HashSet<String> {
+    let gateway = conn
+        .query_row(
+            "SELECT listen_address, listen_port, enable_logging
+             FROM proxy_config WHERE app_type = 'claude'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .ok();
+    let Some((listen_address, listen_port, enable_logging)) = gateway else {
+        return HashSet::new();
+    };
+    if enable_logging == 0 {
+        return HashSet::new();
+    }
+    let Ok(listen_port) = u16::try_from(listen_port) else {
+        return HashSet::new();
+    };
+
+    let providers = match crate::pi_config::read_pi_native_providers() {
+        Ok(providers) => providers,
+        Err(error) => {
+            // 读不到 models.json 时保持旧行为（全部导入），宁可重复也不能丢数据。
+            log::warn!("[PI-SYNC] 无法读取 Pi models.json，跳过网关去重: {error}");
+            return HashSet::new();
+        }
+    };
+    providers
+        .into_iter()
+        .filter(|(_, config)| {
+            config
+                .get("baseUrl")
+                .and_then(Value::as_str)
+                .is_some_and(|base_url| {
+                    base_url_points_at_gateway(base_url, &listen_address, listen_port)
+                })
+        })
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// 判断 Pi provider 的 `baseUrl` 是否指向本地网关。
+///
+/// Pi 的 baseUrl 允许省略 scheme，这里补上 `http://` 后按 URL 解析；
+/// 端口缺省时按 scheme 隐含端口（http 80 / https 443）参与比较。
+fn base_url_points_at_gateway(raw_base_url: &str, listen_address: &str, listen_port: u16) -> bool {
+    let candidate = if raw_base_url.contains("://") {
+        raw_base_url.to_string()
+    } else {
+        format!("http://{raw_base_url}")
+    };
+    let Ok(url) = url::Url::parse(&candidate) else {
+        return false;
+    };
+    if url.port_or_known_default().unwrap_or(0) != listen_port {
+        return false;
+    }
+    match url.host_str() {
+        Some(host) => {
+            let host = strip_ipv6_brackets(host);
+            host == strip_ipv6_brackets(listen_address) || is_loopback_host(host)
+        }
+        None => false,
+    }
+}
+
+/// `Url::host_str` 对 IPv6 返回 `[::1]` 这种带方括号的形式；
+/// 监听地址配置则通常不带。比较前统一去掉方括号。
+fn strip_ipv6_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false)
+}
+
 fn sync_pi_files(db: &Database, files: &[PathBuf]) -> SessionSyncResult {
     let mut result = SessionSyncResult {
         files_scanned: files.len().min(u32::MAX as usize) as u32,
@@ -152,8 +256,17 @@ fn sync_pi_files(db: &Database, files: &[PathBuf]) -> SessionSyncResult {
         }
     };
 
+    // lock_conn! 只能在返回 Result 的函数里展开，这里手动加锁并计入错误。
+    let proxy_routed = match db.conn.lock() {
+        Ok(conn) => proxy_routed_pi_provider_keys(&conn),
+        Err(error) => {
+            result.errors.push(format!("Mutex lock failed: {error}"));
+            return result;
+        }
+    };
+
     for file_path in files {
-        match sync_single_pi_file(db, file_path, &cursors) {
+        match sync_single_pi_file(db, file_path, &cursors, &proxy_routed) {
             Ok(file_result) => result.merge(file_result),
             Err(error) => {
                 let message = format!("{}: {error}", file_path.display());
@@ -178,6 +291,7 @@ fn sync_single_pi_file(
     db: &Database,
     file_path: &Path,
     cursors: &std::collections::HashMap<String, crate::services::session_usage::SyncCursor>,
+    proxy_routed: &HashSet<String>,
 ) -> Result<SessionSyncResult, AppError> {
     let metadata = fs::symlink_metadata(file_path)
         .map_err(|error| AppError::Config(format!("无法读取 Pi 会话文件元数据: {error}")))?;
@@ -230,6 +344,12 @@ fn sync_single_pi_file(
         .map_err(|error| AppError::Database(format!("启动 Pi 用量导入事务失败: {error}")))?;
     let mut result = SessionSyncResult::default();
     for record in &parsed.records {
+        // 网关已把这些请求记为 data_source = "proxy"；再导入一次会让
+        // 仪表盘双重计数，见 #6794。
+        if proxy_routed.contains(record.provider_id.as_str()) {
+            result.skipped = result.skipped.saturating_add(1);
+            continue;
+        }
         if insert_pi_record(&tx, record)? {
             result.imported = result.imported.saturating_add(1);
         } else {
@@ -1075,6 +1195,162 @@ mod tests {
 
         let db = Database::memory()?;
         assert_eq!(sync_pi_files(&db, std::slice::from_ref(&path)).imported, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn gateway_base_url_matching_distinguishes_local_routes() {
+        let matches = |base_url: &str| base_url_points_at_gateway(base_url, "127.0.0.1", 15721);
+        // 显式回环 + 网关端口。
+        assert!(matches("http://127.0.0.1:15721"));
+        assert!(matches("http://127.0.0.1:15721/v1"));
+        assert!(matches("http://localhost:15721"));
+        // Pi 允许省略 scheme。
+        assert!(matches("127.0.0.1:15721"));
+        // IPv6 回环。
+        assert!(matches("http://[::1]:15721"));
+        // 127.0.0.0/8 任意地址。
+        assert!(matches("http://127.0.0.5:15721"));
+        // 上游 API 与错误端口都不匹配。
+        assert!(!matches("https://api.minimaxi.com/v1"));
+        assert!(!matches("http://127.0.0.1:3088"));
+        // 缺省端口按 scheme 隐含值参与比较。
+        assert!(!matches("http://127.0.0.1"));
+        assert!(base_url_points_at_gateway(
+            "http://127.0.0.1",
+            "127.0.0.1",
+            80
+        ));
+        // 非回环监听地址按精确主机名匹配。
+        assert!(base_url_points_at_gateway(
+            "http://192.168.1.5:15721",
+            "192.168.1.5",
+            15721
+        ));
+        assert!(!base_url_points_at_gateway(
+            "http://192.168.1.6:15721",
+            "192.168.1.5",
+            15721
+        ));
+        // 0.0.0.0 监听时回环主机仍视为指向本机。
+        assert!(base_url_points_at_gateway(
+            "http://127.0.0.1:15721",
+            "0.0.0.0",
+            15721
+        ));
+    }
+
+    fn write_gateway_fixtures(agent_dir: &Path) -> Result<(), AppError> {
+        std::fs::write(
+            agent_dir.join("models.json"),
+            r#"{
+  "providers": {
+    "cc-switch-proxy": {
+      "name": "CCS Gateway",
+      "baseUrl": "http://127.0.0.1:15721",
+      "api": "anthropic",
+      "apiKey": "PROXY_MANAGED",
+      "models": [{"id": "glm-5.3-flash"}]
+    },
+    "direct-provider": {
+      "name": "Direct",
+      "baseUrl": "https://api.example.com/v1",
+      "api": "openai-completions",
+      "apiKey": "secret",
+      "models": [{"id": "direct-model"}]
+    }
+  }
+}"#,
+        )
+        .map_err(|error| AppError::Config(format!("写入 Pi models.json 失败: {error}")))?;
+        Ok(())
+    }
+
+    fn gateway_session_path(root: &Path) -> PathBuf {
+        session_path(root, "gateway-routing")
+    }
+
+    fn gateway_session_lines() -> Vec<String> {
+        let assistant = |id: &str, provider: &str| {
+            format!(
+                r#"{{"type":"message","id":"{id}","parentId":null,"timestamp":"2023-11-14T22:13:21Z","message":{{"role":"assistant","content":[{{"type":"text","text":"ok"}}],"provider":"{provider}","model":"m","timestamp":1700000000000,"usage":{{"input":10,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":12,"cost":{{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}}},"stopReason":"stop"}}}}"#
+            )
+        };
+        vec![
+            r#"{"type":"session","version":3,"id":"session-gateway","timestamp":"2023-11-14T22:13:20Z","cwd":"/work"}"#
+                .to_string(),
+            assistant("proxied", "cc-switch-proxy"),
+            assistant("direct", "direct-provider"),
+        ]
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn gateway_routed_provider_usage_is_not_imported() -> Result<(), AppError> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _agent = crate::pi_config::test_support::TestAgentDir::at(temp.path());
+        write_gateway_fixtures(temp.path())?;
+
+        let path = gateway_session_path(temp.path());
+        let lines = gateway_session_lines();
+        let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_lines(&path, &line_refs);
+
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT OR REPLACE INTO proxy_config (
+                    app_type, listen_address, listen_port, enable_logging
+                 ) VALUES ('claude', '127.0.0.1', 15721, 1)",
+                [],
+            )?;
+        }
+
+        let result = sync_pi_files(&db, std::slice::from_ref(&path));
+        assert_eq!(result.imported, 1);
+        assert_eq!(result.skipped, 1);
+        assert!(result.errors.is_empty());
+
+        let conn = lock_conn!(db.conn);
+        let providers: Vec<String> = conn
+            .prepare(
+                "SELECT provider_id FROM proxy_request_logs
+                 WHERE data_source = 'pi_session' ORDER BY provider_id",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(providers, vec!["direct-provider".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn gateway_without_usage_logging_keeps_importing() -> Result<(), AppError> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _agent = crate::pi_config::test_support::TestAgentDir::at(temp.path());
+        write_gateway_fixtures(temp.path())?;
+
+        let path = gateway_session_path(temp.path());
+        let lines = gateway_session_lines();
+        let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_lines(&path, &line_refs);
+
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            // enable_logging = 0：网关不落用量行，pi_session 是唯一记录，必须导入。
+            conn.execute(
+                "INSERT OR REPLACE INTO proxy_config (
+                    app_type, listen_address, listen_port, enable_logging
+                 ) VALUES ('claude', '127.0.0.1', 15721, 0)",
+                [],
+            )?;
+        }
+
+        let result = sync_pi_files(&db, std::slice::from_ref(&path));
+        assert_eq!(result.imported, 2);
+        assert_eq!(result.skipped, 0);
         Ok(())
     }
 
