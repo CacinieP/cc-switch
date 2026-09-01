@@ -285,32 +285,23 @@ fn refresh_system_proxy_if_changed() {
     }
 }
 
-/// 解析当前"跟随系统代理"应使用的代理 URL（已过滤失效的本机代理）
-///
-/// 优先级：环境变量（HTTPS_PROXY > HTTP_PROXY > ALL_PROXY）→ macOS 系统代理
-/// （SCDynamicStore，HTTPS 优先于 HTTP）。解析结果若指向本机 loopback 且端口
-/// 无进程监听（代理工具已退出/切换为 TUN 模式），视为无代理（直连），避免
-/// 客户端把请求持续发往失效代理导致所有查询瞬间失败。
-fn current_effective_system_proxy() -> Option<String> {
-    let candidate = env_system_proxy_url()
+/// 原始解析"跟随系统代理"的目标：环境变量 → macOS 系统代理（不做存活判定）
+fn raw_system_proxy_url() -> Option<String> {
+    env_system_proxy_url()
         .or_else(macos_system_proxy_url)
         .map(|url| url.trim().to_string())
-        .filter(|url| !url.is_empty());
+        .filter(|url| !url.is_empty())
+}
 
-    match candidate {
-        Some(url) => {
-            if proxy_url_is_loopback(&url) && !loopback_proxy_listening(&url) {
-                log::warn!(
-                    "[GlobalProxy] System proxy {} points to a local port with no listener, bypassing to direct connection",
-                    mask_url(&url)
-                );
-                None
-            } else {
-                Some(url)
-            }
-        }
-        None => None,
-    }
+/// 解析当前"跟随系统代理"的有效结果（已过滤失效的本机代理）
+///
+/// 在 [`raw_system_proxy_url`] 基础上做存活判定：解析结果若指向本机 loopback
+/// 且端口无进程监听（代理工具已退出/切换为 TUN 模式），视为无代理（直连），
+/// 避免客户端把请求持续发往失效代理导致所有查询瞬间失败。该结果同时用作
+/// 变化检测的签名（见 [`refresh_system_proxy_if_changed`]）。
+fn current_effective_system_proxy() -> Option<String> {
+    raw_system_proxy_url()
+        .filter(|url| !proxy_url_is_loopback(url) || loopback_proxy_listening(url))
 }
 
 /// 从环境变量解析代理 URL（与 hyper-util 的优先级对齐：HTTPS > HTTP > ALL）
@@ -501,32 +492,25 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
         // 未设置全局代理时，跟随系统代理。reqwest 内建的自动跟随只在客户端
         // 构建时读取一次系统状态：应用启动后系统代理关闭/切换（代理工具退出、
         // 转为 TUN 模式）会让客户端永远把请求发往失效代理，所有用量查询瞬间
-        // 失败且只能靠重启恢复。因此 macOS 上改为显式解析 + 死本机代理旁路 +
-        // 运行时跟随变化（见 get()），不再交给 reqwest 自动烘焙。
+        // 失败且只能靠重启恢复。因此 macOS 上额外做两件事（其余平台行为不变）：
+        //   1) 构建时若解析出的系统代理指向本机已无监听的端口，旁路为直连；
+        //   2) get() 中节流地检测解析结果变化并按需重建（见 refresh_system_proxy_if_changed）。
+        // 代理存活时仍完全交给 reqwest 自动跟随（语义忠实：分协议、NO_PROXY 等）。
         if system_proxy_points_to_loopback() {
             builder = builder.no_proxy();
             log::warn!(
                 "[GlobalProxy] System proxy points to localhost, bypassing to avoid recursion"
             );
         } else if cfg!(target_os = "macos") {
-            // 禁用 reqwest 的自动系统代理，改用我们自己解析的结果
-            builder = builder.no_proxy();
-            if let Some(proxy_url) = current_effective_system_proxy() {
-                match reqwest::Proxy::all(&proxy_url) {
-                    Ok(proxy) => {
-                        builder = builder.proxy(proxy);
-                        log::debug!(
-                            "[GlobalProxy] Following system proxy: {}",
-                            mask_url(&proxy_url)
-                        );
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "[GlobalProxy] Invalid system proxy {}: {e}, using direct connection",
-                            mask_url(&proxy_url)
-                        );
-                    }
-                }
+            let raw = raw_system_proxy_url();
+            if let Some(dead_url) =
+                raw.filter(|url| proxy_url_is_loopback(url) && !loopback_proxy_listening(url))
+            {
+                builder = builder.no_proxy();
+                log::warn!(
+                    "[GlobalProxy] System proxy {} points to a local port with no listener, bypassing to direct connection",
+                    mask_url(&dead_url)
+                );
             }
         } else {
             log::debug!("[GlobalProxy] Following system proxy (no explicit proxy configured)");
