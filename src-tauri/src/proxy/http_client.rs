@@ -8,8 +8,8 @@ use reqwest::Client;
 use std::env;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
-use std::time::Duration;
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 /// 全局 HTTP 客户端实例
 static GLOBAL_CLIENT: OnceCell<RwLock<Client>> = OnceCell::new();
@@ -20,18 +20,36 @@ static CURRENT_PROXY_URL: OnceCell<RwLock<Option<String>>> = OnceCell::new();
 /// CC Switch 代理服务器当前监听的端口
 static CC_SWITCH_PROXY_PORT: OnceCell<RwLock<u16>> = OnceCell::new();
 
-/// 当前全局客户端所采用的"跟随系统代理"结果（None = 直连）。
-/// 显式用户代理生效时该值无意义（刷新逻辑会让位于用户设置）。
-static BAKED_SYSTEM_PROXY: OnceCell<RwLock<Option<String>>> = OnceCell::new();
+/// "跟随系统代理"的结构化解析快照（分协议 + NO_PROXY）。
+///
+/// reqwest/hyper-util 内部按 http/https/all 三类代理外加 NO_PROXY 分别生效，
+/// 单个 `Option<String>` 无法表达这些语义：HTTPS 不变、仅 HTTP 变化，或仅
+/// NO_PROXY 变化时，单 URL 签名都看不见。快照按 hyper-util 的规则构造
+/// （环境变量优先，macOS 系统配置只填补仍为空的协议槽），用作变化检测签名。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct SystemProxySnapshot {
+    http: Option<String>,
+    https: Option<String>,
+    all: Option<String>,
+    no_proxy: Option<String>,
+}
+
+/// 当前全局客户端烘焙时的系统代理快照；`None` 表示显式代理生效
+/// （刷新逻辑让位于用户设置）或尚未初始化。
+static BAKED_SYSTEM_SNAPSHOT: OnceCell<RwLock<Option<SystemProxySnapshot>>> = OnceCell::new();
+
+/// 状态代数：每次 init/apply/update 显式修改全局客户端前递增。
+/// 自动刷新提交重建结果时会校验代数，避免覆盖并发发生的显式配置。
+static STATE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// 客户端因系统代理变化而重建的次数（诊断与回归测试用）
 static SYSTEM_PROXY_REBUILD_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// 上次检查系统代理变化的时间戳（毫秒），用于节流
-static LAST_SYSTEM_PROXY_CHECK_MS: AtomicU64 = AtomicU64::new(0);
+/// 上次检查系统代理变化的时间（单调时钟，系统时间回拨不影响节流）
+static LAST_SYSTEM_PROXY_CHECK: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// 跟随系统代理的变化检查间隔（毫秒）
-const SYSTEM_PROXY_RECHECK_INTERVAL_MS: u64 = 5000;
+/// 跟随系统代理的变化检查间隔
+const SYSTEM_PROXY_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 设置 CC Switch 代理服务器的监听端口
 ///
@@ -82,7 +100,12 @@ pub fn init(proxy_url: Option<&str>) -> Result<(), String> {
 
     // 初始化代理 URL 记录
     let _ = CURRENT_PROXY_URL.set(RwLock::new(effective_url.map(|s| s.to_string())));
-    record_baked_system_proxy(effective_url);
+    STATE_GENERATION.fetch_add(1, Ordering::AcqRel);
+    store_baked_system_snapshot(if effective_url.is_some() {
+        None
+    } else {
+        Some(read_system_proxy_snapshot())
+    });
 
     log::info!(
         "[GlobalProxy] Initialized: {}",
@@ -124,6 +147,9 @@ pub fn apply_proxy(proxy_url: Option<&str>) -> Result<(), String> {
 
     // 更新客户端
     if let Some(lock) = GLOBAL_CLIENT.get() {
+        // 先递增代数再写入：自动刷新若在此期间提交，会因代数不匹配而放弃，
+        // 不会覆盖刚应用的显式代理。
+        STATE_GENERATION.fetch_add(1, Ordering::AcqRel);
         let mut client = lock.write().map_err(|e| {
             log::error!("[GlobalProxy] [GP-001] Failed to acquire write lock: {e}");
             "Failed to update proxy: lock poisoned".to_string()
@@ -142,7 +168,11 @@ pub fn apply_proxy(proxy_url: Option<&str>) -> Result<(), String> {
         })?;
         *url = effective_url.map(|s| s.to_string());
     }
-    record_baked_system_proxy(effective_url);
+    store_baked_system_snapshot(if effective_url.is_some() {
+        None
+    } else {
+        Some(read_system_proxy_snapshot())
+    });
 
     log::info!(
         "[GlobalProxy] Applied: {}",
@@ -169,6 +199,7 @@ pub fn update_proxy(proxy_url: Option<&str>) -> Result<(), String> {
 
     // 更新客户端
     if let Some(lock) = GLOBAL_CLIENT.get() {
+        STATE_GENERATION.fetch_add(1, Ordering::AcqRel);
         let mut client = lock.write().map_err(|e| {
             log::error!("[GlobalProxy] [GP-001] Failed to acquire write lock: {e}");
             "Failed to update proxy: lock poisoned".to_string()
@@ -187,7 +218,11 @@ pub fn update_proxy(proxy_url: Option<&str>) -> Result<(), String> {
         })?;
         *url = effective_url.map(|s| s.to_string());
     }
-    record_baked_system_proxy(effective_url);
+    store_baked_system_snapshot(if effective_url.is_some() {
+        None
+    } else {
+        Some(read_system_proxy_snapshot())
+    });
 
     log::info!(
         "[GlobalProxy] Updated: {}",
@@ -202,11 +237,15 @@ pub fn update_proxy(proxy_url: Option<&str>) -> Result<(), String> {
 /// 获取全局 HTTP 客户端
 ///
 /// 返回配置了代理的客户端（如果已配置代理），否则返回跟随系统代理的客户端。
-/// 未配置显式代理时（macOS），会节流地检测系统代理变化并按需重建客户端，
-/// 避免应用启动后系统代理关闭/切换导致请求持续打到失效代理上。
+/// 未配置显式代理时（macOS），会节流地检测系统代理配置变化并按需重建客户端，
+/// 避免应用启动后系统代理关闭/切换导致请求持续打到已移除的代理上。
+///
+/// 注意：这里只跟随"配置"变化，不做代理性存活性探测——系统仍配置代理但
+/// 代理进程未监听时保持 fail-closed（请求按 reqwest 语义正常报错），不静默
+/// 直连，避免绕过用户依赖代理实现的流量隔离/审计策略。
 pub fn get() -> Client {
-    // 先做节流的变化检测再取客户端：若系统代理已变化，本次调用就直接拿到
-    // 重建后的客户端，而不是把旧客户端（可能仍指向失效代理）多返回一次。
+    // 先做节流的变化检测再取客户端：若系统代理配置已变化，本次调用就直接
+    // 拿到重建后的客户端，而不是把旧客户端多返回一次。
     refresh_system_proxy_if_changed();
 
     GLOBAL_CLIENT
@@ -219,37 +258,34 @@ pub fn get() -> Client {
         })
 }
 
-/// 写入"当前客户端所采用的系统代理解析结果"快照（未初始化则初始化）
-fn store_baked_system_proxy(baked: Option<String>) {
-    match BAKED_SYSTEM_PROXY.get() {
+/// 写入当前全局客户端烘焙时的系统代理快照（未初始化则初始化）
+fn store_baked_system_snapshot(baked: Option<SystemProxySnapshot>) {
+    match BAKED_SYSTEM_SNAPSHOT.get() {
         Some(lock) => {
             if let Ok(mut baked_lock) = lock.write() {
                 *baked_lock = baked;
             }
         }
         None => {
-            let _ = BAKED_SYSTEM_PROXY.set(RwLock::new(baked));
+            let _ = BAKED_SYSTEM_SNAPSHOT.set(RwLock::new(baked));
         }
     }
 }
 
-/// 记录当前全局客户端所采用的系统代理解析结果
-///
-/// 显式用户代理时无需记录（刷新逻辑让位于用户设置），传 `Some(_)` 即可。
-fn record_baked_system_proxy(explicit_url: Option<&str>) {
-    let baked = if explicit_url.is_some() {
-        None
-    } else {
-        current_effective_system_proxy()
-    };
-    store_baked_system_proxy(baked);
+/// 读取当前烘焙快照的克隆
+fn baked_system_snapshot() -> Option<SystemProxySnapshot> {
+    BAKED_SYSTEM_SNAPSHOT
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .and_then(|snapshot| snapshot.clone())
 }
 
-/// 节流地检查"跟随系统代理"的解析结果是否变化，变化则重建全局客户端
+/// 节流地检查"跟随系统代理"的配置是否变化，变化则重建全局客户端
 ///
 /// 仅在未配置显式代理时生效；显式代理由用户管理，不参与自动刷新。
-/// 平台边界：变化检测只服务 macOS 的死本机代理旁路（见 [`build_client`]），
-/// 其余平台维持原有行为，不做周期性解析。
+/// 平台边界：reqwest 只在构建时读取一次系统代理，长驻进程里配置关闭/
+/// 切换后旧客户端会一直指向失效目标，这个检测只服务该场景的 macOS 桌面
+/// 应用；其余平台维持原有行为，不做周期性解析。
 fn refresh_system_proxy_if_changed() {
     if !cfg!(target_os = "macos") {
         return;
@@ -260,98 +296,126 @@ fn refresh_system_proxy_if_changed() {
         return;
     }
 
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let last = LAST_SYSTEM_PROXY_CHECK_MS.load(Ordering::Relaxed);
-    if now_ms.saturating_sub(last) < SYSTEM_PROXY_RECHECK_INTERVAL_MS {
+    // 单调时钟节流。try_lock 失败说明已有并发检测在进行，直接让位，
+    // 避免多个线程同时通过间隔检查并各自重建一次。
+    let Ok(mut last_check) = LAST_SYSTEM_PROXY_CHECK.try_lock() else {
+        return;
+    };
+    if last_check.is_some_and(|last| last.elapsed() < SYSTEM_PROXY_RECHECK_INTERVAL) {
         return;
     }
-    LAST_SYSTEM_PROXY_CHECK_MS.store(now_ms, Ordering::Relaxed);
+    *last_check = Some(Instant::now());
+    drop(last_check);
 
-    let current = current_effective_system_proxy();
-    let baked = BAKED_SYSTEM_PROXY
-        .get()
-        .and_then(|lock| lock.read().ok())
-        .and_then(|b| b.clone());
-    if current == baked {
+    let seen_generation = STATE_GENERATION.load(Ordering::Acquire);
+    let baked = baked_system_snapshot();
+    // 快照为 None 说明显式代理刚被应用（或未初始化），让位
+    let Some(previous) = baked else {
+        return;
+    };
+
+    let current = read_system_proxy_snapshot();
+    if current == previous {
         return;
     }
 
-    // 系统代理状态发生变化（开启/关闭/换端口/存活状态翻转），重建客户端
-    match build_client(None) {
-        Ok(new_client) => {
-            if let Some(lock) = GLOBAL_CLIENT.get() {
-                if let Ok(mut client) = lock.write() {
-                    *client = new_client;
-                    store_baked_system_proxy(current.clone());
-                    SYSTEM_PROXY_REBUILD_COUNT.fetch_add(1, Ordering::Relaxed);
-                    log::info!(
-                        "[GlobalProxy] System proxy changed, rebuilt client: {}",
-                        current
-                            .as_deref()
-                            .map(mask_url)
-                            .unwrap_or_else(|| "direct connection".to_string())
-                    );
-                }
-            }
-        }
+    // 系统代理配置发生变化（开启/关闭/换地址/换端口/NO_PROXY 调整），重建
+    let new_client = match build_client(None) {
+        Ok(client) => client,
         Err(e) => {
-            log::warn!("[GlobalProxy] Failed to rebuild client after system proxy change: {e}")
+            log::warn!("[GlobalProxy] Failed to rebuild client after system proxy change: {e}");
+            return;
         }
+    };
+    log::info!(
+        "[GlobalProxy] System proxy configuration changed, rebuilt client (http={:?}, https={:?}, all={:?}, no_proxy={:?})",
+        current.http.as_deref().map(mask_url),
+        current.https.as_deref().map(mask_url),
+        current.all.as_deref().map(mask_url),
+        current.no_proxy.is_some()
+    );
+    if commit_system_refresh(new_client, seen_generation, previous, current) {
+        SYSTEM_PROXY_REBUILD_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
-fn system_proxy_rebuild_count() -> u64 {
-    SYSTEM_PROXY_REBUILD_COUNT.load(Ordering::Relaxed)
-}
-
-#[cfg(all(test, target_os = "macos"))]
-fn reset_system_proxy_check_throttle() {
-    LAST_SYSTEM_PROXY_CHECK_MS.store(0, Ordering::Relaxed);
-}
-
-/// 原始解析"跟随系统代理"的目标：环境变量 → macOS 系统代理（不做存活判定）
-fn raw_system_proxy_url() -> Option<String> {
-    env_system_proxy_url()
-        .or_else(macos_system_proxy_url)
-        .map(|url| url.trim().to_string())
-        .filter(|url| !url.is_empty())
-}
-
-/// 解析当前"跟随系统代理"的有效结果（已过滤失效的本机代理）
+/// 提交一次系统代理刷新的重建结果
 ///
-/// 在 [`raw_system_proxy_url`] 基础上做存活判定：解析结果若指向本机 loopback
-/// 且端口无进程监听（代理工具已退出/切换为 TUN 模式），视为无代理（直连），
-/// 避免客户端把请求持续发往失效代理导致所有查询瞬间失败。该结果同时用作
-/// 变化检测的签名（见 [`refresh_system_proxy_if_changed`]）。
-fn current_effective_system_proxy() -> Option<String> {
-    raw_system_proxy_url()
-        .filter(|url| !proxy_url_is_loopback(url) || loopback_proxy_listening(url))
+/// 提交前在写锁内校验：显式代理仍为空、状态代数未变、烘焙快照仍是检测时
+/// 的那份。任一不满足即放弃（例如用户在检测期间应用了显式代理，或另一路
+/// 刷新已经提交过），防止自动刷新覆盖用户设置或造成新旧状态错位。
+fn commit_system_refresh(
+    candidate: Client,
+    seen_generation: u64,
+    previous: SystemProxySnapshot,
+    updated: SystemProxySnapshot,
+) -> bool {
+    let Some(client_lock) = GLOBAL_CLIENT.get() else {
+        return false;
+    };
+    let mut client = match client_lock.write() {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+
+    if STATE_GENERATION.load(Ordering::Acquire) != seen_generation {
+        return false;
+    }
+    if get_current_proxy_url().is_some() {
+        return false;
+    }
+    if baked_system_snapshot().as_ref() != Some(&previous) {
+        return false;
+    }
+
+    *client = candidate;
+    store_baked_system_snapshot(Some(updated));
+    true
 }
 
-/// 从环境变量解析代理 URL（与 hyper-util 的优先级对齐：HTTPS > HTTP > ALL）
-fn env_system_proxy_url() -> Option<String> {
-    const KEY_GROUPS: [&[&str]; 3] = [
-        &["HTTPS_PROXY", "https_proxy"],
-        &["HTTP_PROXY", "http_proxy"],
-        &["ALL_PROXY", "all_proxy"],
-    ];
-    KEY_GROUPS.iter().find_map(|keys| {
+/// 读取"跟随系统代理"的结构化解析结果（环境变量优先，系统配置填空）
+fn read_system_proxy_snapshot() -> SystemProxySnapshot {
+    let mut snapshot = env_system_proxy_snapshot();
+
+    // macOS 系统配置只填补环境变量仍为空的协议槽（与 hyper-util 的
+    // "环境变量优先、系统配置补缺"顺序一致）
+    #[cfg(target_os = "macos")]
+    {
+        let (system_http, system_https) = macos_system_proxy_entries();
+        if snapshot.https.is_none() {
+            snapshot.https = system_https;
+        }
+        if snapshot.http.is_none() {
+            snapshot.http = system_http;
+        }
+    }
+
+    snapshot
+}
+
+/// 从环境变量解析分协议代理 URL（优先级：大写与小写同组同权，组间
+/// 按协议独立，不再折叠成单个 URL）
+fn env_system_proxy_snapshot() -> SystemProxySnapshot {
+    let env_group = |keys: &[&str]| {
         keys.iter().find_map(|key| {
             env::var(key)
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         })
-    })
+    };
+    SystemProxySnapshot {
+        http: env_group(&["HTTP_PROXY", "http_proxy"]),
+        https: env_group(&["HTTPS_PROXY", "https_proxy"]),
+        all: env_group(&["ALL_PROXY", "all_proxy"]),
+        no_proxy: env_group(&["NO_PROXY", "no_proxy"]),
+    }
 }
 
-/// 读取 macOS 系统代理（SCDynamicStore，与 reqwest/hyper-util 的数据源一致）
+/// macOS 系统代理的分协议条目（SCDynamicStore，与 reqwest/hyper-util 的
+/// 数据源一致），返回 (http, https)
 #[cfg(target_os = "macos")]
-fn macos_system_proxy_url() -> Option<String> {
+fn macos_system_proxy_entries() -> (Option<String>, Option<String>) {
     use system_configuration::core_foundation::base::CFType;
     use system_configuration::core_foundation::dictionary::CFDictionary;
     use system_configuration::core_foundation::number::CFNumber;
@@ -385,86 +449,44 @@ fn macos_system_proxy_url() -> Option<String> {
             .find(port_key)
             .and_then(|v| v.downcast::<CFNumber>())
             .and_then(|v| v.to_i32())?;
-        Some(format!("http://{host}:{port}"))
+        Some(format_proxy_entry(&host, port))
     }
 
-    let store = SCDynamicStoreBuilder::new("cc-switch").build()?;
-    let proxies_map = store.get_proxies()?;
-    // HTTPS 代理优先：用量查询目标几乎全是 https 端点
-    read_entry(
-        &proxies_map,
-        unsafe { kSCPropNetProxiesHTTPSEnable },
-        unsafe { kSCPropNetProxiesHTTPSProxy },
-        unsafe { kSCPropNetProxiesHTTPSPort },
-    )
-    .or_else(|| {
-        read_entry(
-            &proxies_map,
-            unsafe { kSCPropNetProxiesHTTPEnable },
-            unsafe { kSCPropNetProxiesHTTPProxy },
-            unsafe { kSCPropNetProxiesHTTPPort },
-        )
-    })
-}
-
-#[cfg(not(target_os = "macos"))]
-fn macos_system_proxy_url() -> Option<String> {
-    None
-}
-
-/// 判断代理 URL 是否指向本机 loopback 地址
-fn proxy_url_is_loopback(url: &str) -> bool {
-    let parsed = url::Url::parse(url)
-        .ok()
-        .or_else(|| url::Url::parse(&format!("http://{url}")).ok());
-    parsed
-        .as_ref()
-        .and_then(|parsed| parsed.host_str())
-        .map(host_is_loopback)
-        .unwrap_or(false)
-}
-
-/// 探测 loopback 代理端口是否有进程监听
-///
-/// 仅对 loopback 地址做探测（连接为微秒级）；非 loopback 地址一律视为可用。
-fn loopback_proxy_listening(url: &str) -> bool {
-    use std::net::TcpStream;
-
-    let parsed = url::Url::parse(url)
-        .ok()
-        .or_else(|| url::Url::parse(&format!("http://{url}")).ok());
-    let Some(parsed) = parsed else {
-        return false;
-    };
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    if !host_is_loopback(host) {
-        return true;
+    fn read_entries() -> Option<(Option<String>, Option<String>)> {
+        let store = SCDynamicStoreBuilder::new("cc-switch").build()?;
+        let proxies_map = store.get_proxies()?;
+        Some((
+            read_entry(
+                &proxies_map,
+                unsafe { kSCPropNetProxiesHTTPEnable },
+                unsafe { kSCPropNetProxiesHTTPProxy },
+                unsafe { kSCPropNetProxiesHTTPPort },
+            ),
+            read_entry(
+                &proxies_map,
+                unsafe { kSCPropNetProxiesHTTPSEnable },
+                unsafe { kSCPropNetProxiesHTTPSProxy },
+                unsafe { kSCPropNetProxiesHTTPSPort },
+            ),
+        ))
     }
-    let Some(port) = parsed.port_or_known_default() else {
-        return false;
-    };
 
-    use std::net::ToSocketAddrs;
-    let addrs = match (host, port).to_socket_addrs() {
-        Ok(addrs) => addrs.collect::<Vec<_>>(),
-        Err(_) => return false,
-    };
-    addrs
-        .iter()
-        .any(|addr| TcpStream::connect_timeout(addr, Duration::from_millis(300)).is_ok())
+    // SCDynamicStore 读取失败时按"无系统代理"处理，交给环境变量与直连语义
+    read_entries().unwrap_or((None, None))
 }
 
-fn host_is_loopback(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
+/// 把系统代理条目的 host:port 组装成 URL（裸 IPv6 地址补方括号）
+#[cfg(target_os = "macos")]
+fn format_proxy_entry(host: &str, port: i32) -> String {
+    let is_bare_ipv6 = host
+        .parse::<IpAddr>()
+        .map(|address| address.is_ipv6())
+        .unwrap_or(false);
+    if is_bare_ipv6 {
+        format!("http://[{host}]:{port}")
+    } else {
+        format!("http://{host}:{port}")
     }
-    // url crate 对 IPv6 host 保留方括号（如 "[::1]"），解析前需剥掉
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    host.parse::<IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
 }
 
 /// 获取当前代理 URL
@@ -516,33 +538,17 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
             .map_err(|e| format!("Invalid proxy URL '{}': {}", mask_url(url), e))?;
         builder = builder.proxy(proxy);
         log::debug!("[GlobalProxy] Proxy configured: {}", mask_url(url));
+    } else if system_proxy_points_to_loopback() {
+        builder = builder.no_proxy();
+        log::warn!("[GlobalProxy] System proxy points to localhost, bypassing to avoid recursion");
     } else {
-        // 未设置全局代理时，跟随系统代理。reqwest 内建的自动跟随只在客户端
-        // 构建时读取一次系统状态：应用启动后系统代理关闭/切换（代理工具退出、
-        // 转为 TUN 模式）会让客户端永远把请求发往失效代理，所有用量查询瞬间
-        // 失败且只能靠重启恢复。因此 macOS 上额外做两件事（其余平台行为不变）：
-        //   1) 构建时若解析出的系统代理指向本机已无监听的端口，旁路为直连；
-        //   2) get() 中节流地检测解析结果变化并按需重建（见 refresh_system_proxy_if_changed）。
-        // 代理存活时仍完全交给 reqwest 自动跟随（语义忠实：分协议、NO_PROXY 等）。
-        if system_proxy_points_to_loopback() {
-            builder = builder.no_proxy();
-            log::warn!(
-                "[GlobalProxy] System proxy points to localhost, bypassing to avoid recursion"
-            );
-        } else if cfg!(target_os = "macos") {
-            let raw = raw_system_proxy_url();
-            if let Some(dead_url) =
-                raw.filter(|url| proxy_url_is_loopback(url) && !loopback_proxy_listening(url))
-            {
-                builder = builder.no_proxy();
-                log::warn!(
-                    "[GlobalProxy] System proxy {} points to a local port with no listener, bypassing to direct connection",
-                    mask_url(&dead_url)
-                );
-            }
-        } else {
-            log::debug!("[GlobalProxy] Following system proxy (no explicit proxy configured)");
-        }
+        // 跟随系统代理。reqwest 内建的自动跟随只在客户端构建时读取一次系统
+        // 状态：长驻进程里系统代理配置关闭/切换（代理工具退出、转为 TUN
+        // 模式）会让客户端继续使用已移除的代理。macOS 上由 get() 节流检测
+        // 配置变化并重建（见 refresh_system_proxy_if_changed）；代理语义
+        // （分协议、NO_PROXY）完全交由 reqwest 处理，不做存活探测，也不在
+        // 配置仍指向代理时静默直连。
+        log::debug!("[GlobalProxy] Following system proxy (no explicit proxy configured)");
     }
 
     builder
@@ -593,6 +599,17 @@ fn proxy_points_to_loopback(value: &str) -> bool {
     false
 }
 
+fn host_is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // url crate 对 IPv6 host 保留方括号（如 "[::1]"），解析前需剥掉
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
 /// 隐藏 URL 中的敏感信息（用于日志）
 pub fn mask_url(url: &str) -> String {
     if let Ok(parsed) = url::Url::parse(url) {
@@ -620,6 +637,23 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    const ENV_KEYS: [&str; 8] = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ];
+
+    fn clear_proxy_env() {
+        for key in ENV_KEYS {
+            std::env::remove_var(key);
+        }
     }
 
     #[test]
@@ -696,18 +730,7 @@ mod tests {
         // 设置 CC Switch 代理端口
         set_proxy_port(15721);
 
-        let keys = [
-            "HTTP_PROXY",
-            "http_proxy",
-            "HTTPS_PROXY",
-            "https_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-        ];
-
-        for key in &keys {
-            std::env::remove_var(key);
-        }
+        clear_proxy_env();
 
         // 指向 CC Switch 端口的代理应该被跳过
         std::env::set_var("HTTP_PROXY", "http://127.0.0.1:15721");
@@ -721,146 +744,99 @@ mod tests {
         std::env::set_var("HTTP_PROXY", "http://10.0.0.2:7890");
         assert!(!system_proxy_points_to_loopback());
 
-        for key in &keys {
-            std::env::remove_var(key);
-        }
+        clear_proxy_env();
     }
 
     #[test]
-    fn test_proxy_url_is_loopback() {
-        assert!(proxy_url_is_loopback("http://127.0.0.1:7892"));
-        assert!(proxy_url_is_loopback("http://localhost:7892"));
-        assert!(proxy_url_is_loopback("socks5://127.0.0.1:1080"));
-        // [::1] 带 scheme 与裸 host:port 两种写法
-        assert!(proxy_url_is_loopback("http://[::1]:7892"));
-        assert!(!proxy_url_is_loopback("http://192.168.1.10:7890"));
-        assert!(!proxy_url_is_loopback("http://proxy.example.com:8080"));
-    }
-
-    #[test]
-    fn test_loopback_proxy_listening() {
-        // 未监听的 loopback 端口：探测应返回 false
-        assert!(!loopback_proxy_listening("http://127.0.0.1:9"));
-
-        // 实际监听中的端口：探测应返回 true
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        assert!(loopback_proxy_listening(&format!(
-            "http://127.0.0.1:{port}"
-        )));
-
-        // 非 loopback 地址不探测，直接视为可用
-        assert!(loopback_proxy_listening("http://192.168.1.10:7890"));
-    }
-
-    #[test]
-    fn test_env_system_proxy_url_priority() {
+    fn test_env_system_proxy_snapshot_per_protocol() {
         let _guard = env_lock().lock().unwrap();
 
-        let keys = [
-            "HTTP_PROXY",
-            "http_proxy",
-            "HTTPS_PROXY",
-            "https_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-        ];
-        for key in &keys {
-            std::env::remove_var(key);
-        }
+        clear_proxy_env();
+        assert_eq!(
+            env_system_proxy_snapshot(),
+            SystemProxySnapshot::default(),
+            "no env vars must produce an empty snapshot"
+        );
 
-        // 无环境变量时返回 None
-        assert_eq!(env_system_proxy_url(), None);
-
-        // HTTPS_PROXY 优先于 HTTP_PROXY 与 ALL_PROXY
+        // 分协议独立解析，不再折叠成单个 URL
         std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:8899");
         std::env::set_var("HTTP_PROXY", "http://127.0.0.1:7800");
         std::env::set_var("ALL_PROXY", "socks5://127.0.0.1:7801");
+        std::env::set_var("NO_PROXY", "localhost,127.0.0.1");
         assert_eq!(
-            env_system_proxy_url(),
-            Some("http://127.0.0.1:8899".to_string())
-        );
-
-        // 无 HTTPS 时回退到 HTTP_PROXY
-        std::env::remove_var("HTTPS_PROXY");
-        assert_eq!(
-            env_system_proxy_url(),
-            Some("http://127.0.0.1:7800".to_string())
+            env_system_proxy_snapshot(),
+            SystemProxySnapshot {
+                http: Some("http://127.0.0.1:7800".to_string()),
+                https: Some("http://127.0.0.1:8899".to_string()),
+                all: Some("socks5://127.0.0.1:7801".to_string()),
+                no_proxy: Some("localhost,127.0.0.1".to_string()),
+            }
         );
 
         // 小写变量同样生效
-        for key in &keys {
-            std::env::remove_var(key);
-        }
+        clear_proxy_env();
         std::env::set_var("https_proxy", "http://127.0.0.1:8899");
         assert_eq!(
-            env_system_proxy_url(),
-            Some("http://127.0.0.1:8899".to_string())
+            env_system_proxy_snapshot(),
+            SystemProxySnapshot {
+                https: Some("http://127.0.0.1:8899".to_string()),
+                ..Default::default()
+            }
         );
 
-        for key in &keys {
-            std::env::remove_var(key);
-        }
+        clear_proxy_env();
     }
 
     #[test]
-    fn test_effective_system_proxy_bypasses_dead_loopback() {
-        let _guard = env_lock().lock().unwrap();
-
-        let keys = [
-            "HTTP_PROXY",
-            "http_proxy",
-            "HTTPS_PROXY",
-            "https_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-        ];
-        for key in &keys {
-            std::env::remove_var(key);
-        }
-
-        // 环境变量指向无监听的 loopback 端口：应旁路为直连（None）
-        std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:9");
-        assert_eq!(current_effective_system_proxy(), None);
-
-        // 环境变量指向存活端口：应保留该代理
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::env::set_var("HTTPS_PROXY", format!("http://127.0.0.1:{port}"));
+    #[cfg(target_os = "macos")]
+    fn test_format_proxy_entry_brackets_bare_ipv6() {
         assert_eq!(
-            current_effective_system_proxy(),
-            Some(format!("http://127.0.0.1:{port}"))
+            format_proxy_entry("127.0.0.1", 7890),
+            "http://127.0.0.1:7890"
         );
-
-        for key in &keys {
-            std::env::remove_var(key);
-        }
+        assert_eq!(format_proxy_entry("::1", 7890), "http://[::1]:7890");
+        assert_eq!(
+            format_proxy_entry("proxy.example.com", 8080),
+            "http://proxy.example.com:8080"
+        );
     }
 
-    /// 初始化全局客户端并强制刷新系统代理快照（消除 init 路径差异）
+    #[test]
+    fn test_snapshot_detects_http_only_and_no_proxy_only_changes() {
+        let _guard = env_lock().lock().unwrap();
+        clear_proxy_env();
+
+        // HTTPS 固定，仅 HTTP 变化：签名必须能看见
+        std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:8899");
+        std::env::set_var("HTTP_PROXY", "http://127.0.0.1:7800");
+        let before = read_system_proxy_snapshot();
+        std::env::set_var("HTTP_PROXY", "http://127.0.0.1:7801");
+        assert_ne!(read_system_proxy_snapshot(), before);
+
+        // 仅 NO_PROXY 变化：签名必须能看见
+        let before = read_system_proxy_snapshot();
+        std::env::set_var("NO_PROXY", "localhost");
+        assert_ne!(read_system_proxy_snapshot(), before);
+
+        clear_proxy_env();
+    }
+
+    /// 初始化全局客户端并烘焙当前快照（消除 init 路径差异）
     #[cfg(target_os = "macos")]
     fn setup_global_client_with_current_snapshot() {
         if GLOBAL_CLIENT.get().is_none() {
             let _ = init(None);
         }
-        record_baked_system_proxy(None);
+        store_baked_system_snapshot(Some(read_system_proxy_snapshot()));
     }
 
     #[cfg(target_os = "macos")]
-    fn clear_proxy_env() {
-        for key in [
-            "HTTP_PROXY",
-            "http_proxy",
-            "HTTPS_PROXY",
-            "https_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-        ] {
-            std::env::remove_var(key);
+    fn reset_system_proxy_check_throttle() {
+        if let Ok(mut last_check) = LAST_SYSTEM_PROXY_CHECK.try_lock() {
+            *last_check = None;
         }
     }
 
-    // 变化检测与重建行为是 macOS 专属（其余平台 refresh 为 no-op）
     #[test]
     #[serial_test::serial]
     #[cfg(target_os = "macos")]
@@ -868,9 +844,7 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         clear_proxy_env();
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::env::set_var("HTTPS_PROXY", format!("http://127.0.0.1:{port}"));
+        std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:8899");
 
         setup_global_client_with_current_snapshot();
         let before = system_proxy_rebuild_count();
@@ -893,37 +867,111 @@ mod tests {
     #[test]
     #[serial_test::serial]
     #[cfg(target_os = "macos")]
-    fn test_rebuild_once_when_system_proxy_dies() {
+    fn test_rebuild_once_when_system_proxy_config_removed() {
         let _guard = env_lock().lock().unwrap();
         clear_proxy_env();
 
-        // 代理存活时初始化快照，随后关掉监听模拟代理工具退出
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::env::set_var("HTTPS_PROXY", format!("http://127.0.0.1:{port}"));
+        // 代理配置存在时初始化快照，随后移除配置模拟系统代理被关闭
+        std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:8899");
 
         setup_global_client_with_current_snapshot();
         let before = system_proxy_rebuild_count();
 
-        drop(listener);
+        std::env::remove_var("HTTPS_PROXY");
         reset_system_proxy_check_throttle();
         refresh_system_proxy_if_changed();
-        let after_death = system_proxy_rebuild_count();
+        let after_change = system_proxy_rebuild_count();
         assert_eq!(
-            after_death,
+            after_change,
             before + 1,
-            "system proxy dying must trigger exactly one rebuild"
+            "system proxy config removal must trigger exactly one rebuild"
         );
 
-        // 代理保持死亡：后续检测不应再次重建
+        // 配置保持移除：后续检测不应再次重建
         reset_system_proxy_check_throttle();
         refresh_system_proxy_if_changed();
         assert_eq!(
             system_proxy_rebuild_count(),
-            after_death,
-            "keep-direct state must not rebuild repeatedly"
+            after_change,
+            "stable config must not rebuild repeatedly"
         );
 
         clear_proxy_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(target_os = "macos")]
+    fn test_refresh_yields_to_explicit_proxy() {
+        let _guard = env_lock().lock().unwrap();
+        clear_proxy_env();
+
+        setup_global_client_with_current_snapshot();
+
+        // 用户应用显式代理后，配置变化检测必须让位：不重建、不覆盖
+        std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:8899");
+        apply_proxy(Some("http://127.0.0.1:7890")).expect("apply explicit proxy");
+        let before = system_proxy_rebuild_count();
+
+        reset_system_proxy_check_throttle();
+        refresh_system_proxy_if_changed();
+        assert_eq!(
+            system_proxy_rebuild_count(),
+            before,
+            "explicit proxy must suppress automatic refresh"
+        );
+        assert_eq!(
+            get_current_proxy_url().as_deref(),
+            Some("http://127.0.0.1:7890"),
+            "explicit proxy must stay recorded"
+        );
+        assert_eq!(
+            baked_system_snapshot(),
+            None,
+            "snapshot must be cleared while explicit proxy is active"
+        );
+
+        // 恢复直连（跟随系统）以便后续测试
+        apply_proxy(None).expect("restore direct");
+        clear_proxy_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(target_os = "macos")]
+    fn test_stale_refresh_cannot_overwrite_explicit_proxy() {
+        let _guard = env_lock().lock().unwrap();
+        clear_proxy_env();
+
+        setup_global_client_with_current_snapshot();
+        let previous = baked_system_snapshot().expect("snapshot after setup");
+
+        // 模拟竞态：刷新流程读到旧代数后，用户应用了显式代理
+        let stale_generation = STATE_GENERATION.load(Ordering::Acquire);
+        std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:8899");
+        apply_proxy(Some("http://127.0.0.1:7890")).expect("apply explicit proxy");
+        let updated = read_system_proxy_snapshot();
+        let candidate = build_client(None).expect("candidate client");
+
+        // 过期代数的提交必须被拒绝：客户端与记录都保持显式代理
+        assert!(!commit_system_refresh(
+            candidate,
+            stale_generation,
+            previous,
+            updated
+        ));
+        assert_eq!(
+            get_current_proxy_url().as_deref(),
+            Some("http://127.0.0.1:7890"),
+            "stale refresh must not clobber the explicit proxy record"
+        );
+
+        apply_proxy(None).expect("restore direct");
+        clear_proxy_env();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn system_proxy_rebuild_count() -> u64 {
+        SYSTEM_PROXY_REBUILD_COUNT.load(Ordering::Relaxed)
     }
 }
