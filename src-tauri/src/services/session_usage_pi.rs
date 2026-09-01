@@ -150,7 +150,10 @@ pub fn sync_pi_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
 /// 否则同一笔调用在仪表盘里被计两次（#6794）。
 ///
 /// - 端口必须等于网关监听端口（`proxy_config` 三行互为镜像，读 claude 行）；
-/// - 主机是回环地址或等于监听地址即视为指向本机网关；
+/// - 主机必须按实际 bind 范围匹配：精确等于监听地址；监听地址是通配
+///   （`0.0.0.0`/`::`）时任意回环主机；监听地址是回环 IP 时额外接受
+///   `localhost`。绑定 `127.0.0.1` 时不把 `127.0.0.5` 这类其他回环接口
+///   视为同一服务；
 /// - `enable_logging` 关闭时网关不落用量行，此时 pi_session 是唯一记录，
 ///   不做过滤。
 fn proxy_routed_pi_provider_keys(conn: &rusqlite::Connection) -> HashSet<String> {
@@ -217,12 +220,28 @@ fn base_url_points_at_gateway(raw_base_url: &str, listen_address: &str, listen_p
         return false;
     }
     match url.host_str() {
-        Some(host) => {
-            let host = strip_ipv6_brackets(host);
-            host == strip_ipv6_brackets(listen_address) || is_loopback_host(host)
-        }
+        Some(host) => host_points_at_gateway(host, listen_address),
         None => false,
     }
+}
+
+/// 主机名是否按网关的实际 bind 范围指向网关。
+fn host_points_at_gateway(host: &str, listen_address: &str) -> bool {
+    let host = strip_ipv6_brackets(host);
+    let listen = strip_ipv6_brackets(listen_address);
+    if host == listen {
+        return true;
+    }
+    // 通配绑定监听所有接口，任意回环主机都能到达。
+    if listen == "0.0.0.0" || listen == "::" {
+        return is_loopback_host(host);
+    }
+    // 回环绑定只额外接受 localhost（本机名称解析指向回环）；
+    // 绑定 127.0.0.1 时 127.0.0.5:同端口 是另一个独立 socket，不算网关。
+    if is_loopback_host(listen) {
+        return host == "localhost";
+    }
+    false
 }
 
 /// `Url::host_str` 对 IPv6 返回 `[::1]` 这种带方括号的形式；
@@ -1207,10 +1226,10 @@ mod tests {
         assert!(matches("http://localhost:15721"));
         // Pi 允许省略 scheme。
         assert!(matches("127.0.0.1:15721"));
-        // IPv6 回环。
-        assert!(matches("http://[::1]:15721"));
-        // 127.0.0.0/8 任意地址。
-        assert!(matches("http://127.0.0.5:15721"));
+        // 回环绑定按 bind 范围匹配：IPv6 回环和 127.0.0.0/8 的其他
+        // 接口都是独立 socket，不算同一个网关。
+        assert!(!matches("http://[::1]:15721"));
+        assert!(!matches("http://127.0.0.5:15721"));
         // 上游 API 与错误端口都不匹配。
         assert!(!matches("https://api.minimaxi.com/v1"));
         assert!(!matches("http://127.0.0.1:3088"));
@@ -1232,10 +1251,36 @@ mod tests {
             "192.168.1.5",
             15721
         ));
-        // 0.0.0.0 监听时回环主机仍视为指向本机。
+        // 0.0.0.0 通配监听时任意回环主机都指向本机网关。
         assert!(base_url_points_at_gateway(
             "http://127.0.0.1:15721",
             "0.0.0.0",
+            15721
+        ));
+        assert!(base_url_points_at_gateway(
+            "http://127.0.0.5:15721",
+            "0.0.0.0",
+            15721
+        ));
+        assert!(base_url_points_at_gateway(
+            "http://[::1]:15721",
+            "0.0.0.0",
+            15721
+        ));
+        // :: 通配（IPv6）同理；::1 精确绑定只接受自身与 localhost。
+        assert!(base_url_points_at_gateway(
+            "http://[::1]:15721",
+            "::",
+            15721
+        ));
+        assert!(base_url_points_at_gateway(
+            "http://[::1]:15721",
+            "::1",
+            15721
+        ));
+        assert!(base_url_points_at_gateway(
+            "http://localhost:15721",
+            "::1",
             15721
         ));
     }
