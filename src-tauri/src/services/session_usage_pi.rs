@@ -150,10 +150,10 @@ pub fn sync_pi_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
 /// 否则同一笔调用在仪表盘里被计两次（#6794）。
 ///
 /// - 端口必须等于网关监听端口（`proxy_config` 三行互为镜像，读 claude 行）；
-/// - 主机必须按实际 bind 范围匹配：精确等于监听地址；监听地址是通配
-///   （`0.0.0.0`/`::`）时任意回环主机；监听地址是回环 IP 时额外接受
-///   `localhost`。绑定 `127.0.0.1` 时不把 `127.0.0.5` 这类其他回环接口
-///   视为同一服务；
+/// - 主机必须按实际 bind 范围匹配：精确等于监听地址；监听地址是 IPv4/IPv6
+///   通配（`0.0.0.0`/`::`）时只匹配对应地址族的回环主机（另加 `localhost`
+///   兼容分支）；监听地址是回环 IP 时额外接受 `localhost`。绑定 `127.0.0.1`
+///   时不把 `127.0.0.5` 这类其他回环接口视为同一服务；
 /// - `enable_logging` 关闭时网关不落用量行，此时 pi_session 是唯一记录，
 ///   不做过滤。
 fn proxy_routed_pi_provider_keys(conn: &rusqlite::Connection) -> HashSet<String> {
@@ -226,22 +226,33 @@ fn base_url_points_at_gateway(raw_base_url: &str, listen_address: &str, listen_p
 }
 
 /// 主机名是否按网关的实际 bind 范围指向网关。
+///
+/// 通配绑定按地址族匹配：`0.0.0.0` 只接受 IPv4 回环，`::` 只保证接受 IPv6
+/// 回环（是否同时接受 IPv4 取决于 dual-stack / `IPV6_V6ONLY`，不假定）。
+/// `localhost` 单独作为兼容分支接受——它在绑定了回环的本机网关上几乎总是
+/// 可达。判定不确定时宁可返回 false（保留导入、允许重复），也不要误跳过
+/// 造成用量缺失。
 fn host_points_at_gateway(host: &str, listen_address: &str) -> bool {
     let host = strip_ipv6_brackets(host);
     let listen = strip_ipv6_brackets(listen_address);
     if host == listen {
         return true;
     }
-    // 通配绑定监听所有接口，任意回环主机都能到达。
-    if listen == "0.0.0.0" || listen == "::" {
-        return is_loopback_host(host);
+    match listen {
+        "0.0.0.0" => host == "localhost" || is_loopback_host_of_family(host, false),
+        "::" => host == "localhost" || is_loopback_host_of_family(host, true),
+        // 回环绑定只额外接受 localhost（本机名称解析指向回环）；
+        // 绑定 127.0.0.1 时 127.0.0.5:同端口 是另一个独立 socket，不算网关。
+        _ if is_loopback_host(listen) => host == "localhost",
+        _ => false,
     }
-    // 回环绑定只额外接受 localhost（本机名称解析指向回环）；
-    // 绑定 127.0.0.1 时 127.0.0.5:同端口 是另一个独立 socket，不算网关。
-    if is_loopback_host(listen) {
-        return host == "localhost";
-    }
-    false
+}
+
+/// host 是否为指定地址族（ipv6=false 即 IPv4）的回环字面量。
+fn is_loopback_host_of_family(host: &str, ipv6: bool) -> bool {
+    host.parse::<IpAddr>()
+        .map(|address| address.is_loopback() && address.is_ipv6() == ipv6)
+        .unwrap_or(false)
 }
 
 /// `Url::host_str` 对 IPv6 返回 `[::1]` 这种带方括号的形式；
@@ -1251,7 +1262,7 @@ mod tests {
             "192.168.1.5",
             15721
         ));
-        // 0.0.0.0 通配监听时任意回环主机都指向本机网关。
+        // IPv4 通配监听只匹配 IPv4 回环与 localhost；::1 到不了 0.0.0.0。
         assert!(base_url_points_at_gateway(
             "http://127.0.0.1:15721",
             "0.0.0.0",
@@ -1263,16 +1274,33 @@ mod tests {
             15721
         ));
         assert!(base_url_points_at_gateway(
+            "http://localhost:15721",
+            "0.0.0.0",
+            15721
+        ));
+        assert!(!base_url_points_at_gateway(
             "http://[::1]:15721",
             "0.0.0.0",
             15721
         ));
-        // :: 通配（IPv6）同理；::1 精确绑定只接受自身与 localhost。
+        // IPv6 通配只保证匹配 IPv6 回环与 localhost；是否接受 IPv4 取决于
+        // dual-stack，不假定，宁可保留导入也不误跳过。
         assert!(base_url_points_at_gateway(
             "http://[::1]:15721",
             "::",
             15721
         ));
+        assert!(base_url_points_at_gateway(
+            "http://localhost:15721",
+            "::",
+            15721
+        ));
+        assert!(!base_url_points_at_gateway(
+            "http://127.0.0.1:15721",
+            "::",
+            15721
+        ));
+        // ::1 精确绑定只接受自身与 localhost。
         assert!(base_url_points_at_gateway(
             "http://[::1]:15721",
             "::1",
