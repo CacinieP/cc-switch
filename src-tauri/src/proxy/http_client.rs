@@ -142,6 +142,7 @@ pub fn apply_proxy(proxy_url: Option<&str>) -> Result<(), String> {
         })?;
         *url = effective_url.map(|s| s.to_string());
     }
+    record_baked_system_proxy(effective_url);
 
     log::info!(
         "[GlobalProxy] Applied: {}",
@@ -247,7 +248,13 @@ fn record_baked_system_proxy(explicit_url: Option<&str>) {
 /// 节流地检查"跟随系统代理"的解析结果是否变化，变化则重建全局客户端
 ///
 /// 仅在未配置显式代理时生效；显式代理由用户管理，不参与自动刷新。
+/// 平台边界：变化检测只服务 macOS 的死本机代理旁路（见 [`build_client`]），
+/// 其余平台维持原有行为，不做周期性解析。
 fn refresh_system_proxy_if_changed() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+
     // 显式用户代理生效时，跳过自动刷新
     if get_current_proxy_url().is_some() {
         return;
@@ -296,12 +303,12 @@ fn refresh_system_proxy_if_changed() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn system_proxy_rebuild_count() -> u64 {
     SYSTEM_PROXY_REBUILD_COUNT.load(Ordering::Relaxed)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn reset_system_proxy_check_throttle() {
     LAST_SYSTEM_PROXY_CHECK_MS.store(0, Ordering::Relaxed);
 }
@@ -819,7 +826,7 @@ mod tests {
         // 环境变量指向存活端口：应保留该代理
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        std::env::set_var("HTTPS_PROXY", &format!("http://127.0.0.1:{port}"));
+        std::env::set_var("HTTPS_PROXY", format!("http://127.0.0.1:{port}"));
         assert_eq!(
             current_effective_system_proxy(),
             Some(format!("http://127.0.0.1:{port}"))
@@ -831,6 +838,7 @@ mod tests {
     }
 
     /// 初始化全局客户端并强制刷新系统代理快照（消除 init 路径差异）
+    #[cfg(target_os = "macos")]
     fn setup_global_client_with_current_snapshot() {
         if GLOBAL_CLIENT.get().is_none() {
             let _ = init(None);
@@ -838,6 +846,7 @@ mod tests {
         record_baked_system_proxy(None);
     }
 
+    #[cfg(target_os = "macos")]
     fn clear_proxy_env() {
         for key in [
             "HTTP_PROXY",
@@ -851,15 +860,17 @@ mod tests {
         }
     }
 
+    // 变化检测与重建行为是 macOS 专属（其余平台 refresh 为 no-op）
     #[test]
     #[serial_test::serial]
+    #[cfg(target_os = "macos")]
     fn test_no_rebuild_when_system_proxy_unchanged() {
         let _guard = env_lock().lock().unwrap();
         clear_proxy_env();
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        std::env::set_var("HTTPS_PROXY", &format!("http://127.0.0.1:{port}"));
+        std::env::set_var("HTTPS_PROXY", format!("http://127.0.0.1:{port}"));
 
         setup_global_client_with_current_snapshot();
         let before = system_proxy_rebuild_count();
@@ -881,6 +892,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    #[cfg(target_os = "macos")]
     fn test_rebuild_once_when_system_proxy_dies() {
         let _guard = env_lock().lock().unwrap();
         clear_proxy_env();
@@ -888,7 +900,7 @@ mod tests {
         // 代理存活时初始化快照，随后关掉监听模拟代理工具退出
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        std::env::set_var("HTTPS_PROXY", &format!("http://127.0.0.1:{port}"));
+        std::env::set_var("HTTPS_PROXY", format!("http://127.0.0.1:{port}"));
 
         setup_global_client_with_current_snapshot();
         let before = system_proxy_rebuild_count();
