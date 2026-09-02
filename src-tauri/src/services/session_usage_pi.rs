@@ -10,6 +10,13 @@
 //! uses (`pi_config::provider_base_url`): the provider-level `baseUrl` first,
 //! then per-model `baseUrl` overrides, so a provider mixing direct and
 //! gateway-routed models is only excluded for the gateway ones.
+//!
+//! Config matching is only a pre-filter: a record is actually skipped only
+//! when the gateway still has a usage row for that very request, joined by
+//! the upstream response id. A call made while gateway logging was disabled
+//! has no such row, so it stays on the session import — flipping
+//! `enable_logging` (or a missed gateway log line) can never drop the only
+//! copy of a call.
 
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
@@ -55,6 +62,15 @@ const PI_LEGACY_SEMANTIC_DEDUP_SQL: &str = "SELECT EXISTS(
          SELECT 1 FROM session_usage_dedup
          WHERE data_source = ?1 AND semantic_id = ?2 AND has_entry_id = 0
      )";
+// 网关用量行的 request_id 形如 `session:{app_type}:{provider}:{上游 message_id}`，
+// 按 `:{response_id}` 尾缀精确匹配（substr 而非 LIKE，避免 id 里的 `_`/`%`
+// 被当通配符）；created_at 收窄到记录时间 ±1 天以走 created_at 索引。
+const PI_GATEWAY_EVIDENCE_SQL: &str = "SELECT EXISTS(
+         SELECT 1 FROM proxy_request_logs
+         WHERE data_source = 'proxy'
+           AND created_at BETWEEN ?2 - 86400 AND ?2 + 86400
+           AND substr(request_id, -(length(?1) + 1)) = ':' || ?1
+     )";
 
 #[derive(Debug, Clone, Copy, Default)]
 struct PiCosts {
@@ -91,6 +107,7 @@ struct PiUsageRecord {
     provider_id: String,
     model: String,
     request_model: String,
+    response_id: Option<String>,
     input_tokens: u32,
     output_tokens: u32,
     cache_read_tokens: u32,
@@ -170,6 +187,25 @@ fn is_gateway_routed(
         .is_some_and(|models| models.all_models || models.models.contains(request_model))
 }
 
+/// 网关是否真的为这笔请求记过用量行（按上游响应 id 关联）。
+///
+/// 这是请求时刻的事实证据：`enable_logging` 此后怎么翻转、provider 之后
+/// 是否改回直连，都不影响这笔请求当年有没有被网关记账。请求时日志开关
+/// 还关着（网关不落行）或网关漏记时，这里返回 false，pi_session 记录
+/// 必须照常导入，不能丢。
+fn gateway_logged_request(
+    conn: &rusqlite::Connection,
+    response_id: &str,
+    record_created_at: i64,
+) -> Result<bool, AppError> {
+    conn.query_row(
+        PI_GATEWAY_EVIDENCE_SQL,
+        rusqlite::params![response_id, record_created_at],
+        |row| row.get(0),
+    )
+    .map_err(|error| AppError::Database(format!("查询网关用量证据失败: {error}")))
+}
+
 /// 收集请求 URL 指向 CC Switch 本地网关的 Pi provider，按 model 粒度。
 ///
 /// 这些请求已经由网关以 `data_source = "proxy"` 记账，会话导入必须跳过，
@@ -185,7 +221,9 @@ fn is_gateway_routed(
 ///   `request_model` 即 Pi 请求时的 model 名匹配）；
 /// - `enable_logging` 关闭时网关不落用量行，此时 pi_session 是唯一记录，
 ///   不做过滤。
-fn gateway_routed_models_by_provider(conn: &rusqlite::Connection) -> HashMap<String, GatewayRoutedModels> {
+fn gateway_routed_models_by_provider(
+    conn: &rusqlite::Connection,
+) -> HashMap<String, GatewayRoutedModels> {
     let gateway = conn
         .query_row(
             "SELECT listen_address, listen_port, enable_logging
@@ -224,7 +262,9 @@ fn gateway_routed_models_by_provider(conn: &rusqlite::Connection) -> HashMap<Str
         if config
             .get("baseUrl")
             .and_then(Value::as_str)
-            .is_some_and(|base_url| base_url_points_at_gateway(base_url, &listen_address, listen_port))
+            .is_some_and(|base_url| {
+                base_url_points_at_gateway(base_url, &listen_address, listen_port)
+            })
         {
             entry.all_models = true;
         } else if let Some(models) = config.get("models").and_then(Value::as_array) {
@@ -422,10 +462,20 @@ fn sync_single_pi_file(
     let mut result = SessionSyncResult::default();
     for record in &parsed.records {
         // 网关已把这些请求记为 data_source = "proxy"；再导入一次会让
-        // 仪表盘双重计数，见 #6794。
+        // 仪表盘双重计数，见 #6794。配置只说明"现在指向网关"，跳过前还要
+        // 按上游 responseId 确认网关真的记了这笔。
         if is_gateway_routed(proxy_routed, &record.provider_id, &record.request_model) {
-            result.skipped = result.skipped.saturating_add(1);
-            continue;
+            let gateway_logged = match record.response_id.as_deref() {
+                Some(response_id) => gateway_logged_request(&tx, response_id, record.created_at)?,
+                // 记录缺 responseId 时无法建立证据，按"宁可重复"导入。
+                None => false,
+            };
+            if gateway_logged {
+                result.skipped = result.skipped.saturating_add(1);
+                continue;
+            }
+            // 找不到网关证据（请求时日志开关还关着、网关漏记、id 被转换器
+            // 改写等）→ 照常导入，宁可重复也不能静默丢数据。
         }
         if insert_pi_record(&tx, record)? {
             result.imported = result.imported.saturating_add(1);
@@ -712,6 +762,12 @@ fn parse_usage_record(
             UNKNOWN_MODEL.to_string(),
         )
     };
+    // 上游响应 id：网关按它给这笔请求记 data_source = "proxy" 的用量行，
+    // 是判断"这笔调用是否已被网关记账"的请求级证据。
+    let response_id = message
+        .and_then(|value| nonempty_string(value.get("responseId")))
+        .map(truncate_usage_label)
+        .map(str::to_string);
 
     let created_at = event_timestamp_millis
         .map(|timestamp| timestamp / 1000)
@@ -757,6 +813,7 @@ fn parse_usage_record(
         provider_id,
         model,
         request_model,
+        response_id,
         input_tokens,
         output_tokens,
         cache_read_tokens,
@@ -1403,7 +1460,7 @@ mod tests {
     fn gateway_session_lines() -> Vec<String> {
         let assistant = |id: &str, provider: &str, model: &str| {
             format!(
-                r#"{{"type":"message","id":"{id}","parentId":null,"timestamp":"2023-11-14T22:13:21Z","message":{{"role":"assistant","content":[{{"type":"text","text":"ok"}}],"provider":"{provider}","model":"{model}","timestamp":1700000000000,"usage":{{"input":10,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":12,"cost":{{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}}},"stopReason":"stop"}}}}"#
+                r#"{{"type":"message","id":"{id}","parentId":null,"timestamp":"2023-11-14T22:13:21Z","message":{{"role":"assistant","content":[{{"type":"text","text":"ok"}}],"provider":"{provider}","model":"{model}","responseId":"resp-{id}","timestamp":1700000000000,"usage":{{"input":10,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":12,"cost":{{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}}},"stopReason":"stop"}}}}"#
             )
         };
         vec![
@@ -1417,6 +1474,28 @@ mod tests {
             assistant("hybrid-gateway", "hybrid-provider", "gateway-model"),
             assistant("hybrid-direct", "hybrid-provider", "direct-model"),
         ]
+    }
+
+    /// 网关记账的用量行：request_id 以 `:response_id` 结尾，与网关真实写入
+    /// 的 `session:{app_type}:{provider}:{message_id}` 形态一致。
+    fn insert_gateway_log(
+        conn: &rusqlite::Connection,
+        response_id: &str,
+        created_at: i64,
+    ) -> Result<(), AppError> {
+        conn.execute(
+            "INSERT INTO proxy_request_logs (
+                request_id, provider_id, app_type, model, input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens, latency_ms, status_code,
+                created_at, data_source
+             ) VALUES (?1, 'gateway-upstream', 'claude', 'm', 10, 2, 0, 0, 5, 200, ?2, 'proxy')",
+            rusqlite::params![
+                format!("session:claude:ccs-upstream:{response_id}"),
+                created_at
+            ],
+        )
+        .map_err(|error| AppError::Database(format!("写入网关用量行失败: {error}")))?;
+        Ok(())
     }
 
     #[test]
@@ -1440,6 +1519,10 @@ mod tests {
                  ) VALUES ('claude', '127.0.0.1', 15721, 1)",
                 [],
             )?;
+            // 网关给"proxied"与"hybrid-gateway"各留了一笔用量行（记录的
+            // created_at = 1700000001s）。
+            insert_gateway_log(&conn, "resp-proxied", 1_700_000_001)?;
+            insert_gateway_log(&conn, "resp-hybrid-gateway", 1_700_000_001)?;
         }
 
         let result = sync_pi_files(&db, std::slice::from_ref(&path));
@@ -1463,6 +1546,63 @@ mod tests {
                 ("hybrid-provider".to_string(), "direct-model".to_string()),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn gateway_routed_records_without_gateway_evidence_stay_imported() -> Result<(), AppError> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _agent = crate::pi_config::test_support::TestAgentDir::at(temp.path());
+        write_gateway_fixtures(temp.path())?;
+
+        // 网关 provider 的两笔调用：一笔带 responseId 但网关没有对应用量行
+        // （请求时 enable_logging 还是关的），一笔连 responseId 都没有。
+        // 两条都是唯一记录，必须导入，不能按当前配置跳过。
+        let assistant = |id: &str, response_id: &str| {
+            let response_field = if response_id.is_empty() {
+                String::new()
+            } else {
+                format!(r#","responseId":"{response_id}""#)
+            };
+            format!(
+                r#"{{"type":"message","id":"{id}","parentId":null,"timestamp":"2023-11-14T22:13:21Z","message":{{"role":"assistant","content":[{{"type":"text","text":"ok"}}],"provider":"cc-switch-proxy","model":"m"{response_field},"timestamp":1700000000000,"usage":{{"input":10,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":12,"cost":{{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}}},"stopReason":"stop"}}}}"#
+            )
+        };
+        let path = session_path(temp.path(), "gateway-no-evidence");
+        write_lines(
+            &path,
+            &[
+                r#"{"type":"session","version":3,"id":"session-no-evidence","timestamp":"2023-11-14T22:13:20Z","cwd":"/work"}"#,
+                &assistant("logged-while-off", "resp-unrecorded"),
+                &assistant("no-response-id", ""),
+            ],
+        );
+
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            // 现在日志开关是开的：配置把整个 provider 判为网关路由。
+            conn.execute(
+                "INSERT OR REPLACE INTO proxy_config (
+                    app_type, listen_address, listen_port, enable_logging
+                 ) VALUES ('claude', '127.0.0.1', 15721, 1)",
+                [],
+            )?;
+        }
+
+        let result = sync_pi_files(&db, std::slice::from_ref(&path));
+        assert_eq!(result.imported, 2);
+        assert_eq!(result.skipped, 0);
+        assert!(result.errors.is_empty());
+
+        let conn = lock_conn!(db.conn);
+        let imported: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'pi_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(imported, 2);
         Ok(())
     }
 
