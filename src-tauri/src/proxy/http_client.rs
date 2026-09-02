@@ -383,6 +383,8 @@ fn commit_system_refresh(
 
 /// 读取"跟随系统代理"的结构化解析结果（环境变量优先，系统配置填空）
 fn read_system_proxy_snapshot() -> SystemProxySnapshot {
+    // mut 仅在下方 macOS cfg 块中使用，其他平台不触发 unused_mut
+    #[allow(unused_mut)]
     let mut snapshot = env_system_proxy_snapshot();
 
     // macOS 系统配置只填补环境变量仍为空的协议槽（与 hyper-util 的
