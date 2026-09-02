@@ -3,10 +3,13 @@
 //! Pi records normalized token and cost data in its session JSONL files. This
 //! importer keeps direct (non-proxy) Pi usage visible in the shared dashboard.
 //!
-//! Providers whose `models.json` `baseUrl` points at CC Switch's own local
+//! Providers whose `models.json` request URL points at CC Switch's own local
 //! gateway are excluded: the gateway already logs those requests with
 //! `data_source = "proxy"`, so importing them again would double-count every
-//! call in the dashboard.
+//! call in the dashboard. The URL is resolved with the same precedence Pi
+//! uses (`pi_config::provider_base_url`): the provider-level `baseUrl` first,
+//! then per-model `baseUrl` overrides, so a provider mixing direct and
+//! gateway-routed models is only excluded for the gateway ones.
 
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
@@ -20,7 +23,7 @@ use crate::services::usage_stats::find_model_pricing;
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::net::IpAddr;
@@ -144,7 +147,30 @@ pub fn sync_pi_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
     Ok(sync_pi_files(db, &files))
 }
 
-/// 收集 baseUrl 指向 CC Switch 本地网关的 Pi provider 键。
+/// 单个 Pi provider 的网关路由判定结果。
+///
+/// `all_models` 表示顶层 `baseUrl` 指向网关，该 provider 的全部请求都算；
+/// `models` 收集仅在 `models[].baseUrl` 上指向网关的 model id——Pi 允许
+/// provider 顶层直连、个别 model 覆盖为网关地址（解析顺序与
+/// `pi_config::provider_base_url` 一致），这时只有对应请求算走网关。
+#[derive(Debug, Default)]
+struct GatewayRoutedModels {
+    all_models: bool,
+    models: HashSet<String>,
+}
+
+/// (provider, 请求的 model) 是否按配置判定走网关。
+fn is_gateway_routed(
+    routed: &HashMap<String, GatewayRoutedModels>,
+    provider_id: &str,
+    request_model: &str,
+) -> bool {
+    routed
+        .get(provider_id)
+        .is_some_and(|models| models.all_models || models.models.contains(request_model))
+}
+
+/// 收集请求 URL 指向 CC Switch 本地网关的 Pi provider，按 model 粒度。
 ///
 /// 这些请求已经由网关以 `data_source = "proxy"` 记账，会话导入必须跳过，
 /// 否则同一笔调用在仪表盘里被计两次（#6794）。
@@ -154,9 +180,12 @@ pub fn sync_pi_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
 ///   通配（`0.0.0.0`/`::`）时只匹配对应地址族的回环主机（另加 `localhost`
 ///   兼容分支）；监听地址是回环 IP 时额外接受 `localhost`。绑定 `127.0.0.1`
 ///   时不把 `127.0.0.5` 这类其他回环接口视为同一服务；
+/// - provider 顶层 `baseUrl` 命中时整个 provider 都算；否则逐个检查
+///   `models[].baseUrl`，命中的记到对应 model id 上（与记录的
+///   `request_model` 即 Pi 请求时的 model 名匹配）；
 /// - `enable_logging` 关闭时网关不落用量行，此时 pi_session 是唯一记录，
 ///   不做过滤。
-fn proxy_routed_pi_provider_keys(conn: &rusqlite::Connection) -> HashSet<String> {
+fn gateway_routed_models_by_provider(conn: &rusqlite::Connection) -> HashMap<String, GatewayRoutedModels> {
     let gateway = conn
         .query_row(
             "SELECT listen_address, listen_port, enable_logging
@@ -172,13 +201,13 @@ fn proxy_routed_pi_provider_keys(conn: &rusqlite::Connection) -> HashSet<String>
         )
         .ok();
     let Some((listen_address, listen_port, enable_logging)) = gateway else {
-        return HashSet::new();
+        return HashMap::new();
     };
     if enable_logging == 0 {
-        return HashSet::new();
+        return HashMap::new();
     }
     let Ok(listen_port) = u16::try_from(listen_port) else {
-        return HashSet::new();
+        return HashMap::new();
     };
 
     let providers = match crate::pi_config::read_pi_native_providers() {
@@ -186,21 +215,39 @@ fn proxy_routed_pi_provider_keys(conn: &rusqlite::Connection) -> HashSet<String>
         Err(error) => {
             // 读不到 models.json 时保持旧行为（全部导入），宁可重复也不能丢数据。
             log::warn!("[PI-SYNC] 无法读取 Pi models.json，跳过网关去重: {error}");
-            return HashSet::new();
+            return HashMap::new();
         }
     };
-    providers
-        .into_iter()
-        .filter(|(_, config)| {
-            config
-                .get("baseUrl")
-                .and_then(Value::as_str)
-                .is_some_and(|base_url| {
-                    base_url_points_at_gateway(base_url, &listen_address, listen_port)
-                })
-        })
-        .map(|(key, _)| key)
-        .collect()
+    let mut routed = HashMap::new();
+    for (key, config) in providers {
+        let mut entry = GatewayRoutedModels::default();
+        if config
+            .get("baseUrl")
+            .and_then(Value::as_str)
+            .is_some_and(|base_url| base_url_points_at_gateway(base_url, &listen_address, listen_port))
+        {
+            entry.all_models = true;
+        } else if let Some(models) = config.get("models").and_then(Value::as_array) {
+            for model in models {
+                let Some(id) = model.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if model
+                    .get("baseUrl")
+                    .and_then(Value::as_str)
+                    .is_some_and(|base_url| {
+                        base_url_points_at_gateway(base_url, &listen_address, listen_port)
+                    })
+                {
+                    entry.models.insert(id.to_string());
+                }
+            }
+        }
+        if entry.all_models || !entry.models.is_empty() {
+            routed.insert(key, entry);
+        }
+    }
+    routed
 }
 
 /// 判断 Pi provider 的 `baseUrl` 是否指向本地网关。
@@ -288,7 +335,7 @@ fn sync_pi_files(db: &Database, files: &[PathBuf]) -> SessionSyncResult {
 
     // lock_conn! 只能在返回 Result 的函数里展开，这里手动加锁并计入错误。
     let proxy_routed = match db.conn.lock() {
-        Ok(conn) => proxy_routed_pi_provider_keys(&conn),
+        Ok(conn) => gateway_routed_models_by_provider(&conn),
         Err(error) => {
             result.errors.push(format!("Mutex lock failed: {error}"));
             return result;
@@ -321,7 +368,7 @@ fn sync_single_pi_file(
     db: &Database,
     file_path: &Path,
     cursors: &std::collections::HashMap<String, crate::services::session_usage::SyncCursor>,
-    proxy_routed: &HashSet<String>,
+    proxy_routed: &HashMap<String, GatewayRoutedModels>,
 ) -> Result<SessionSyncResult, AppError> {
     let metadata = fs::symlink_metadata(file_path)
         .map_err(|error| AppError::Config(format!("无法读取 Pi 会话文件元数据: {error}")))?;
@@ -376,7 +423,7 @@ fn sync_single_pi_file(
     for record in &parsed.records {
         // 网关已把这些请求记为 data_source = "proxy"；再导入一次会让
         // 仪表盘双重计数，见 #6794。
-        if proxy_routed.contains(record.provider_id.as_str()) {
+        if is_gateway_routed(proxy_routed, &record.provider_id, &record.request_model) {
             result.skipped = result.skipped.saturating_add(1);
             continue;
         }
@@ -1331,6 +1378,16 @@ mod tests {
       "api": "openai-completions",
       "apiKey": "secret",
       "models": [{"id": "direct-model"}]
+    },
+    "hybrid-provider": {
+      "name": "Hybrid",
+      "baseUrl": "https://api.example.com/v1",
+      "api": "openai-completions",
+      "apiKey": "secret",
+      "models": [
+        {"id": "gateway-model", "baseUrl": "http://127.0.0.1:15721"},
+        {"id": "direct-model"}
+      ]
     }
   }
 }"#,
@@ -1344,16 +1401,21 @@ mod tests {
     }
 
     fn gateway_session_lines() -> Vec<String> {
-        let assistant = |id: &str, provider: &str| {
+        let assistant = |id: &str, provider: &str, model: &str| {
             format!(
-                r#"{{"type":"message","id":"{id}","parentId":null,"timestamp":"2023-11-14T22:13:21Z","message":{{"role":"assistant","content":[{{"type":"text","text":"ok"}}],"provider":"{provider}","model":"m","timestamp":1700000000000,"usage":{{"input":10,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":12,"cost":{{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}}},"stopReason":"stop"}}}}"#
+                r#"{{"type":"message","id":"{id}","parentId":null,"timestamp":"2023-11-14T22:13:21Z","message":{{"role":"assistant","content":[{{"type":"text","text":"ok"}}],"provider":"{provider}","model":"{model}","timestamp":1700000000000,"usage":{{"input":10,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":12,"cost":{{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}}},"stopReason":"stop"}}}}"#
             )
         };
         vec![
             r#"{"type":"session","version":3,"id":"session-gateway","timestamp":"2023-11-14T22:13:20Z","cwd":"/work"}"#
                 .to_string(),
-            assistant("proxied", "cc-switch-proxy"),
-            assistant("direct", "direct-provider"),
+            // 顶层 baseUrl 指向网关：整个 provider 都算走网关。
+            assistant("proxied", "cc-switch-proxy", "m"),
+            // 顶层直连，与网关无关。
+            assistant("direct", "direct-provider", "m"),
+            // 顶层直连但 model 级 baseUrl 覆盖为网关：只有该 model 算。
+            assistant("hybrid-gateway", "hybrid-provider", "gateway-model"),
+            assistant("hybrid-direct", "hybrid-provider", "direct-model"),
         ]
     }
 
@@ -1381,19 +1443,26 @@ mod tests {
         }
 
         let result = sync_pi_files(&db, std::slice::from_ref(&path));
-        assert_eq!(result.imported, 1);
-        assert_eq!(result.skipped, 1);
+        assert_eq!(result.imported, 2);
+        assert_eq!(result.skipped, 2);
         assert!(result.errors.is_empty());
 
         let conn = lock_conn!(db.conn);
-        let providers: Vec<String> = conn
+        let rows: Vec<(String, String)> = conn
             .prepare(
-                "SELECT provider_id FROM proxy_request_logs
-                 WHERE data_source = 'pi_session' ORDER BY provider_id",
+                "SELECT provider_id, request_model FROM proxy_request_logs
+                 WHERE data_source = 'pi_session' ORDER BY provider_id, request_model",
             )?
-            .query_map([], |row| row.get(0))?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(providers, vec!["direct-provider".to_string()]);
+        // 顶层网关 provider 全跳过；混合 provider 只跳过指向网关的那个 model。
+        assert_eq!(
+            rows,
+            vec![
+                ("direct-provider".to_string(), "m".to_string()),
+                ("hybrid-provider".to_string(), "direct-model".to_string()),
+            ]
+        );
         Ok(())
     }
 
@@ -1422,7 +1491,7 @@ mod tests {
         }
 
         let result = sync_pi_files(&db, std::slice::from_ref(&path));
-        assert_eq!(result.imported, 2);
+        assert_eq!(result.imported, 4);
         assert_eq!(result.skipped, 0);
         Ok(())
     }
