@@ -26,12 +26,18 @@ static CC_SWITCH_PROXY_PORT: OnceCell<RwLock<u16>> = OnceCell::new();
 /// 单个 `Option<String>` 无法表达这些语义：HTTPS 不变、仅 HTTP 变化，或仅
 /// NO_PROXY 变化时，单 URL 签名都看不见。快照按 hyper-util 的规则构造
 /// （环境变量优先，macOS 系统配置只填补仍为空的协议槽），用作变化检测签名。
+///
+/// macOS 上 reqwest 还把系统代理的 bypass 规则（ExceptionsList 与
+/// ExcludeSimpleHostnames）烘焙进客户端，因此快照以 `system_bypass` 记录
+/// 其规范化签名；仅改 bypass 列表时端点槽不变，没有这个字段就检测不到。
+/// 非 macOS 恒为 `None`。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct SystemProxySnapshot {
     http: Option<String>,
     https: Option<String>,
     all: Option<String>,
     no_proxy: Option<String>,
+    system_bypass: Option<String>,
 }
 
 /// 当前全局客户端烘焙时的系统代理快照；`None` 表示显式代理生效
@@ -331,11 +337,12 @@ fn refresh_system_proxy_if_changed() {
         }
     };
     log::info!(
-        "[GlobalProxy] System proxy configuration changed, rebuilt client (http={:?}, https={:?}, all={:?}, no_proxy={:?})",
+        "[GlobalProxy] System proxy configuration changed, rebuilt client (http={:?}, https={:?}, all={:?}, no_proxy={:?}, bypass={:?})",
         current.http.as_deref().map(mask_url),
         current.https.as_deref().map(mask_url),
         current.all.as_deref().map(mask_url),
-        current.no_proxy.is_some()
+        current.no_proxy.is_some(),
+        current.system_bypass
     );
     if commit_system_refresh(new_client, seen_generation, previous, current) {
         SYSTEM_PROXY_REBUILD_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -391,13 +398,17 @@ fn read_system_proxy_snapshot() -> SystemProxySnapshot {
     // "环境变量优先、系统配置补缺"顺序一致）
     #[cfg(target_os = "macos")]
     {
-        let (system_http, system_https) = macos_system_proxy_entries();
+        let (system_http, system_https, system_bypass) = macos_system_proxy_state();
         if snapshot.https.is_none() {
             snapshot.https = system_https;
         }
         if snapshot.http.is_none() {
             snapshot.http = system_http;
         }
+        // bypass 规则恒记录：它与 NO_PROXY 环境变量在 reqwest 里是独立的
+        // 匹配层，没有"环境变量存在则系统 bypass 无效"的可靠结论。多记的
+        // 代价最多是一次幂等的重建，漏记的代价是旧 bypass 规则驻留。
+        snapshot.system_bypass = system_bypass;
     }
 
     snapshot
@@ -419,19 +430,21 @@ fn env_system_proxy_snapshot() -> SystemProxySnapshot {
         https: env_group(&["HTTPS_PROXY", "https_proxy"]),
         all: env_group(&["ALL_PROXY", "all_proxy"]),
         no_proxy: env_group(&["NO_PROXY", "no_proxy"]),
+        system_bypass: None,
     }
 }
 
 /// macOS 系统代理的分协议条目（SCDynamicStore，与 reqwest/hyper-util 的
-/// 数据源一致），返回 (http, https)
+/// 数据源一致），返回 (http, https, bypass 签名)
 #[cfg(target_os = "macos")]
-fn macos_system_proxy_entries() -> (Option<String>, Option<String>) {
+fn macos_system_proxy_state() -> (Option<String>, Option<String>, Option<String>) {
     use system_configuration::core_foundation::base::CFType;
     use system_configuration::core_foundation::dictionary::CFDictionary;
     use system_configuration::core_foundation::number::CFNumber;
     use system_configuration::core_foundation::string::{CFString, CFStringRef};
     use system_configuration::dynamic_store::SCDynamicStoreBuilder;
     use system_configuration::sys::schema_definitions::{
+        kSCPropNetProxiesExceptionsList, kSCPropNetProxiesExcludeSimpleHostnames,
         kSCPropNetProxiesHTTPEnable, kSCPropNetProxiesHTTPPort, kSCPropNetProxiesHTTPProxy,
         kSCPropNetProxiesHTTPSEnable, kSCPropNetProxiesHTTPSPort, kSCPropNetProxiesHTTPSProxy,
     };
@@ -462,7 +475,34 @@ fn macos_system_proxy_entries() -> (Option<String>, Option<String>) {
         Some(format_proxy_entry(&host, port))
     }
 
-    fn read_entries() -> Option<(Option<String>, Option<String>)> {
+    /// ExceptionsList（CFArray<CFString>）+ ExcludeSimpleHostnames 的规范化
+    /// 签名。crate 的 `CFType::downcast` 只支持 `CFArray<*const c_void>`，
+    /// 元素再按 CFStringRef 逐个还原。
+    fn read_bypass(proxies_map: &CFDictionary<CFString, CFType>) -> Option<String> {
+        use system_configuration::core_foundation::array::CFArray;
+        use system_configuration::core_foundation::base::TCFType;
+        let exceptions: Vec<String> = proxies_map
+            .find(unsafe { kSCPropNetProxiesExceptionsList })
+            .and_then(|value| value.downcast::<CFArray<*const std::ffi::c_void>>())
+            .map(|array| {
+                array
+                    .iter()
+                    .map(|entry| unsafe {
+                        CFString::wrap_under_get_rule(*entry as CFStringRef).to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let exclude_simple_hostnames = proxies_map
+            .find(unsafe { kSCPropNetProxiesExcludeSimpleHostnames })
+            .and_then(|flag| flag.downcast::<CFNumber>())
+            .and_then(|flag| flag.to_i32())
+            .unwrap_or(0)
+            == 1;
+        canonical_macos_bypass(exceptions, exclude_simple_hostnames)
+    }
+
+    fn read_entries() -> Option<(Option<String>, Option<String>, Option<String>)> {
         let store = SCDynamicStoreBuilder::new("cc-switch").build()?;
         let proxies_map = store.get_proxies()?;
         Some((
@@ -478,11 +518,37 @@ fn macos_system_proxy_entries() -> (Option<String>, Option<String>) {
                 unsafe { kSCPropNetProxiesHTTPSProxy },
                 unsafe { kSCPropNetProxiesHTTPSPort },
             ),
+            read_bypass(&proxies_map),
         ))
     }
 
     // SCDynamicStore 读取失败时按"无系统代理"处理，交给环境变量与直连语义
-    read_entries().unwrap_or((None, None))
+    read_entries().unwrap_or((None, None, None))
+}
+
+/// bypass 配置的规范化签名：主机名比较不区分大小写，列表顺序无语义，
+/// 统一小写 + 排序去重，避免无语义变化（大小写调整、条目重排）触发重建。
+/// 两者都为空时返回 `None`（与"没有 bypass 规则"同义）。
+#[cfg(target_os = "macos")]
+fn canonical_macos_bypass(
+    exceptions: Vec<String>,
+    exclude_simple_hostnames: bool,
+) -> Option<String> {
+    let mut entries: Vec<String> = exceptions
+        .into_iter()
+        .map(|entry| entry.trim().to_lowercase())
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    entries.sort();
+    entries.dedup();
+    if entries.is_empty() && !exclude_simple_hostnames {
+        return None;
+    }
+    Some(format!(
+        "exclude_simple_hostnames={};list={}",
+        u8::from(exclude_simple_hostnames),
+        entries.join(",")
+    ))
 }
 
 /// 把系统代理条目的 host:port 组装成 URL（裸 IPv6 地址补方括号）
@@ -780,6 +846,7 @@ mod tests {
                 https: Some("http://127.0.0.1:8899".to_string()),
                 all: Some("socks5://127.0.0.1:7801".to_string()),
                 no_proxy: Some("localhost,127.0.0.1".to_string()),
+                system_bypass: None,
             }
         );
 
@@ -829,6 +896,71 @@ mod tests {
         assert_ne!(read_system_proxy_snapshot(), before);
 
         clear_proxy_env();
+    }
+
+    #[test]
+    fn test_snapshot_detects_system_bypass_only_change() {
+        // macOS 用户只改 bypass/exception 列表、HTTP/HTTPS 端点不变时，
+        // reqwest 烘焙进客户端的匹配器已变；快照必须能看见（这是
+        // refresh_system_proxy_if_changed 里 `current == previous` 的判定
+        // 输入），否则客户端会一直沿用旧的 bypass 规则。
+        let endpoints = SystemProxySnapshot {
+            http: Some("http://127.0.0.1:7890".to_string()),
+            https: Some("http://127.0.0.1:7890".to_string()),
+            ..Default::default()
+        };
+        let with_exceptions = SystemProxySnapshot {
+            system_bypass: Some(
+                "exclude_simple_hostnames=0;list=*.internal,10.0.0.0/8".to_string(),
+            ),
+            ..endpoints.clone()
+        };
+        assert_ne!(endpoints, with_exceptions);
+
+        let changed_exceptions = SystemProxySnapshot {
+            system_bypass: Some("exclude_simple_hostnames=0;list=*.internal".to_string()),
+            ..endpoints.clone()
+        };
+        assert_ne!(with_exceptions, changed_exceptions);
+
+        // ExcludeSimpleHostnames 翻转同样是有效变化，即使列表为空。
+        let exclude_only = SystemProxySnapshot {
+            system_bypass: Some("exclude_simple_hostnames=1;list=".to_string()),
+            ..endpoints
+        };
+        assert_ne!(exclude_only, SystemProxySnapshot::default());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_canonical_macos_bypass_normalizes_semantically_equal_lists() {
+        // 大小写、空白、顺序、重复项都不构成语义变化。
+        let normalized = canonical_macos_bypass(
+            vec![
+                "  *.Internal ".to_string(),
+                "10.0.0.0/8".to_string(),
+                "*.internal".to_string(),
+            ],
+            false,
+        );
+        assert_eq!(
+            normalized,
+            Some("exclude_simple_hostnames=0;list=*.internal,10.0.0.0/8".to_string())
+        );
+
+        // 无任何规则时为 None（与"没有 bypass"同义）。
+        assert_eq!(canonical_macos_bypass(vec![], false), None);
+        assert_eq!(
+            canonical_macos_bypass(vec!["  ".to_string()], false),
+            None,
+            "空白条目不构成规则"
+        );
+
+        // ExcludeSimpleHostnames 单独开启也是有效签名。
+        assert_eq!(
+            canonical_macos_bypass(vec![], true),
+            Some("exclude_simple_hostnames=1;list=".to_string())
+        );
     }
 
     /// 初始化全局客户端并烘焙当前快照（消除 init 路径差异）
