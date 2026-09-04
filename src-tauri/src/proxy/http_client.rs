@@ -1201,10 +1201,11 @@ mod tests {
             Some("internal,internal.com".to_string())
         );
 
-        // `<local>` 是 Windows 常见条目，hyper-util 原样保留，签名同样保留
+        // `<local>` 是 Windows 常见条目，hyper-util 原样保留，签名同样保留；
+        // `*.` 前缀按 v0.1.20 的全局 `replace("*.", "")` 剥掉，排序后 `<` 在 `e` 前
         assert_eq!(
             canonical_windows_bypass("<local>;*.example.com"),
-            Some("*.example.com,<local>".to_string())
+            Some("<local>,example.com".to_string())
         );
 
         // `127.*` 这类通配符在 v0.1.20 里不被剥除也不转 CIDR，原样记录
