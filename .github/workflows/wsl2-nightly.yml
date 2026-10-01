@@ -1,11 +1,14 @@
 name: WSL2 Nightly
 
-# The full backend suite takes 50+ minutes on a \\wsl.localhost 9P filesystem,
-# so it runs nightly instead of per PR. The per-PR gate in ci.yml only runs the
-# atomic-write contract test against the same WSL2-backed environment.
+# Measured on 2026-09 (30 runs since this workflow landed, 0 green): the serial
+# full backend suite over a \\wsl.localhost 9P filesystem needs ~85+ minutes for
+# the final step alone, so it cannot fit the 90m job timeout. The schedule is
+# disabled until the suite is sharded or parallelized (or the timeout raised).
+# workflow_dispatch still works for manual runs. Follow-up tracked on
+# farion1231/cc-switch#6233.
 on:
-  schedule:
-    - cron: "23 18 * * *" # 02:23 Beijing time
+  # schedule:
+  #   - cron: "23 18 * * *" # 02:23 Beijing time
   workflow_dispatch:
 
 jobs:
@@ -20,7 +23,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8fc893c # stable
 
       - name: Setup WSL2
         uses: Vampire/setup-wsl@d1da7f2c0322a5ee4f24975344f67fc0f5baf364 # v7
