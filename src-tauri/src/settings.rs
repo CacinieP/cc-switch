@@ -302,6 +302,9 @@ pub struct LocalMigrations {
     /// 这样重新开启能把"关闭期间"落入 openai 桶的官方会话补迁进来。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_official_history_unify_v1: Option<CodexOfficialHistoryUnifyMigration>,
+    /// 旧版官方路由桶（`cc-switch-official`）迁回 openai 桶的标记，按 Codex 目录生效。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_legacy_official_history_bucket_v1: Option<CodexLegacyOfficialHistoryBucketMigration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -338,6 +341,20 @@ pub struct CodexOfficialHistoryUnifyMigration {
     pub migrated_state_rows: usize,
     /// 迁移时的规范化 Codex 目录。标记只对同一目录生效：
     /// 切换 codex_config_dir 后旧标记不会挡住新目录的迁移。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_config_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexLegacyOfficialHistoryBucketMigration {
+    pub completed_at: String,
+    pub target_provider_id: String,
+    #[serde(default)]
+    pub migrated_jsonl_files: usize,
+    #[serde(default)]
+    pub migrated_state_rows: usize,
+    /// 迁移时的规范化 Codex 目录，切换 codex_config_dir 后新目录照常迁移。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_config_dir: Option<String>,
 }
@@ -418,9 +435,24 @@ pub struct AppSettings {
     pub unify_codex_migrate_existing: Option<bool>,
     /// Codex 聚合模式下，合并目录里的每个模型都改用经典子 agent 工具（`multi_agent_version`
     /// 写 `"v1"`）。新版工具（v2）把派给子 agent 的任务加密，只有主 agent 那家后端解得开，
-    /// 主、子 agent 不在同一家时子 agent 读不到任务。默认关：保持官方目录的值。
-    #[serde(default)]
-    pub codex_stack_classic_subagents: bool,
+    /// 主、子 agent 不在同一家时子 agent 读不到任务。默认开（代价是没有新版工具的
+    /// followup_task 等功能）。v4.0.10–4.0.12 用的是默认关的 `codexStackClassicSubagents`，
+    /// 每次保存都会写下 `false`，分不清是不是用户关的：换了键名，旧键不再读，升级后一律按开。
+    #[serde(default = "default_true")]
+    pub codex_stack_classic_tools: bool,
+    /// Codex 聚合模式下子 agent 默认用的模型（合并目录里的 slug，`ccs-<key>/<model>`）。
+    /// 不设时跟随主模型。只在这个 slug 还在合并目录里时写进 `[agents]`，否则照样跟随主模型
+    /// （成员移除后保留设置，加回来自动恢复）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_stack_subagent_model: Option<String>,
+    /// 上面那个模型的推理强度。不在它支持的档位里时不写，用模型的默认档。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_stack_subagent_reasoning_effort: Option<String>,
+    /// Codex 聚合模式下自动审批（Auto Review）用的模型（合并目录里的 slug）。不设时用 Codex
+    /// 的默认：官方做默认那家时是官方的 `codex-auto-review`，否则由主模型自己审批。只在这个
+    /// slug 还在合并目录里时写进目录行，规则同子 agent 模型。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_stack_auto_review_model: Option<String>,
     /// User has confirmed the failover toggle first-run notice
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failover_confirmed: Option<bool>,
@@ -490,6 +522,13 @@ pub struct AppSettings {
     /// 当前 Hermes 供应商 ID（本地存储，保持结构一致）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_provider_hermes: Option<String>,
+
+    // ===== 本地路由（设备级）=====
+    /// 写给客户端的代理主机（IP 或主机名），空/未设时按监听地址推（`0.0.0.0` → `127.0.0.1`）。
+    /// 客户端和代理不在同一个网络栈时用，比如 WSL2 NAT 模式里的会话连不到 Windows 的回环。
+    /// 只对这台机器有意义，所以不放在会随云同步覆盖的 proxy_config 表里。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_client_host: Option<String>,
 
     // ===== Skill 同步设置 =====
     /// Skill 同步方式：auto（默认，优先 symlink）、symlink、copy
@@ -567,7 +606,10 @@ impl Default for AppSettings {
             preserve_codex_official_auth_on_switch: false,
             unify_codex_session_history: false,
             unify_codex_migrate_existing: None,
-            codex_stack_classic_subagents: false,
+            codex_stack_classic_tools: true,
+            codex_stack_subagent_model: None,
+            codex_stack_subagent_reasoning_effort: None,
+            codex_stack_auto_review_model: None,
             failover_confirmed: None,
             first_run_notice_confirmed: None,
             new_layout_notice_confirmed: None,
@@ -592,6 +634,7 @@ impl Default for AppSettings {
             current_provider_opencode: None,
             current_provider_openclaw: None,
             current_provider_hermes: None,
+            proxy_client_host: None,
             skill_sync_method: SyncMethod::default(),
             skill_storage_location: SkillStorageLocation::default(),
             webdav_sync: None,
@@ -681,7 +724,7 @@ impl AppSettings {
             .language
             .as_ref()
             .map(|s| s.trim())
-            .filter(|s| matches!(*s, "en" | "zh" | "zh-TW" | "ja"))
+            .filter(|s| matches!(*s, "en" | "zh" | "zh-TW" | "ja" | "tr"))
             .map(|s| s.to_string());
 
         self.quota_display = self
@@ -932,6 +975,25 @@ pub fn clear_codex_official_history_unify_migration() -> Result<(), AppError> {
     })
 }
 
+pub fn is_codex_legacy_official_history_bucket_migrated_for_dir(codex_dir: &str) -> bool {
+    get_settings()
+        .local_migrations
+        .as_ref()
+        .and_then(|migrations| migrations.codex_legacy_official_history_bucket_v1.as_ref())
+        .is_some_and(|migration| migration.codex_config_dir.as_deref() == Some(codex_dir))
+}
+
+pub fn mark_codex_legacy_official_history_bucket_migrated(
+    migration: CodexLegacyOfficialHistoryBucketMigration,
+) -> Result<(), AppError> {
+    mutate_settings(|settings| {
+        settings
+            .local_migrations
+            .get_or_insert_with(Default::default)
+            .codex_legacy_official_history_bucket_v1 = Some(migration);
+    })
+}
+
 pub fn unify_codex_migrate_existing_requested() -> bool {
     get_settings().unify_codex_migrate_existing.unwrap_or(false)
 }
@@ -939,6 +1001,21 @@ pub fn unify_codex_migrate_existing_requested() -> bool {
 pub fn clear_codex_unify_migrate_existing() -> Result<(), AppError> {
     mutate_settings(|settings| {
         settings.unify_codex_migrate_existing = None;
+    })
+}
+
+/// 客户端地址（见 [`AppSettings::proxy_client_host`]），去掉首尾空白；没设或为空时是 `None`。
+pub fn get_proxy_client_host() -> Option<String> {
+    get_settings()
+        .proxy_client_host
+        .map(|host| host.trim().to_string())
+        .filter(|host| !host.is_empty())
+}
+
+pub fn set_proxy_client_host(host: &str) -> Result<(), AppError> {
+    let host = host.trim();
+    mutate_settings(|settings| {
+        settings.proxy_client_host = (!host.is_empty()).then(|| host.to_string());
     })
 }
 
@@ -1038,14 +1115,48 @@ pub fn unify_codex_session_history() -> bool {
         .unify_codex_session_history
 }
 
-pub fn codex_stack_classic_subagents() -> bool {
+pub fn codex_stack_classic_tools() -> bool {
     settings_store()
         .read()
         .unwrap_or_else(|e| {
             log::warn!("设置锁已毒化，使用恢复值: {e}");
             e.into_inner()
         })
-        .codex_stack_classic_subagents
+        .codex_stack_classic_tools
+}
+
+/// Codex 聚合模式下的子 agent 设置：(模型 slug, 推理强度)，空串当作没设。
+pub fn codex_stack_subagent() -> (Option<String>, Option<String>) {
+    let settings = settings_store().read().unwrap_or_else(|e| {
+        log::warn!("设置锁已毒化，使用恢复值: {e}");
+        e.into_inner()
+    });
+    let non_empty = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    (
+        non_empty(&settings.codex_stack_subagent_model),
+        non_empty(&settings.codex_stack_subagent_reasoning_effort),
+    )
+}
+
+/// Codex 聚合模式下的自动审批模型 slug，空串当作没设。
+pub fn codex_stack_auto_review_model() -> Option<String> {
+    settings_store()
+        .read()
+        .unwrap_or_else(|e| {
+            log::warn!("设置锁已毒化，使用恢复值: {e}");
+            e.into_inner()
+        })
+        .codex_stack_auto_review_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
 }
 
 // ===== 当前供应商管理函数 =====
@@ -1246,6 +1357,24 @@ pub fn update_s3_sync_status(status: WebDavSyncStatus) -> Result<(), AppError> {
 mod tests {
     use super::*;
     use crate::app_config::AppType;
+
+    #[test]
+    fn codex_stack_classic_tools_default_on_and_ignore_the_old_off_key() {
+        // v4.0.10–4.0.12 每次保存都写下默认关的旧键：不再读它，升级后按开。
+        let old: AppSettings =
+            serde_json::from_value(serde_json::json!({ "codexStackClassicSubagents": false }))
+                .expect("old settings");
+        assert!(old.codex_stack_classic_tools);
+        assert!(AppSettings::default().codex_stack_classic_tools);
+
+        let off: AppSettings =
+            serde_json::from_value(serde_json::json!({ "codexStackClassicTools": false }))
+                .expect("new settings");
+        assert!(!off.codex_stack_classic_tools);
+        let saved = serde_json::to_value(&off).expect("serialize");
+        assert_eq!(saved["codexStackClassicTools"], false);
+        assert!(saved.get("codexStackClassicSubagents").is_none());
+    }
 
     #[test]
     fn visible_apps_old_settings_default_claude_desktop_visible() {
