@@ -1033,7 +1033,7 @@ fn wsl_claude_update_auto_shell_command(command: &str, flag: Option<&str>) -> St
 /// 出的版本会包含 Windows batch 语义(例如 `|| call npm ...`)且 hermes 会返回
 /// Windows PowerShell installer,但跨 `wsl.exe` 边界后跑的是 Linux。这个 wrapper
 /// 强制生成 POSIX 版命令。
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn wsl_tool_action_shell_command(tool: &str, action: ToolLifecycleAction) -> Option<String> {
     match action {
         ToolLifecycleAction::Install => {
@@ -1138,7 +1138,7 @@ fn build_tool_action_line(
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn build_wsl_tool_action_line(
     distro: &str,
     command: &str,
@@ -1148,7 +1148,7 @@ fn build_wsl_tool_action_line(
     build_wsl_tool_action_line_with_exec(distro, command, force_shell, force_shell_flag, false)
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn build_wsl_tool_action_line_with_exec(
     distro: &str,
     command: &str,
@@ -1178,9 +1178,10 @@ fn build_wsl_tool_action_line_with_exec(
 
     // --exec avoids a second parse by the distro's default shell, which would
     // expand variables in the Claude source probe before the chosen shell runs.
-    // Keep legacy invocation for other tool actions until they have coverage.
+    // All automatic lifecycle actions need the same user-shell PATH as probing.
+    // Keep explicitly selected shells and flags on their existing invocation path.
     let execution = if execute_directly { "--exec" } else { "--" };
-    if execute_directly && force_shell.is_none() {
+    if force_shell.is_none() {
         return Ok(format!(
             "wsl.exe -d {distro} --exec sh -c {}",
             windows_cmd_double_quote_arg(&wsl_claude_update_auto_shell_command(
@@ -1200,12 +1201,12 @@ fn build_wsl_tool_action_line_with_exec(
 /// `win_quote_path_for_batch`(给锚定路径用)都基于它,避免两份 quoter 各自演化、
 /// 未来对同一路径产生不一致引用形态。镜像 POSIX 侧 `shell_single_quote` 与
 /// `quote_path_if_spaced` 的"重量基础 + 轻量条件包装"两层结构。
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn win_double_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\\\""))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn windows_cmd_double_quote_arg(value: &str) -> String {
     win_double_quote(value)
 }
@@ -1745,7 +1746,7 @@ fn try_get_version(tool: &str) -> ShellProbe {
 
 /// 校验 WSL 发行版名称是否合法
 /// WSL 发行版名称只允许字母、数字、连字符、下划线和点（如 `Ubuntu-22.04`）
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn is_valid_wsl_distro_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -1763,7 +1764,7 @@ fn is_valid_shell(shell: &str) -> bool {
 }
 
 /// Validate that the given shell flag is one of the allowed flags.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn is_valid_shell_flag(flag: &str) -> bool {
     matches!(flag, "-c" | "-lc" | "-lic")
 }
@@ -7926,10 +7927,20 @@ mod tests {
         fn wsl_hermes_install_line_does_not_depend_on_outer_pipefail() {
             let line = build_wsl_tool_action_line("Ubuntu", HERMES_INSTALL_UNIX, None, None)
                 .expect("valid WSL command line");
-            assert!(line.starts_with("wsl.exe -d Ubuntu -- sh -c "));
+            assert_eq!(
+                line,
+                format!(
+                    "wsl.exe -d Ubuntu --exec sh -c {}",
+                    windows_cmd_double_quote_arg(&wsl_claude_update_auto_shell_command(
+                        HERMES_INSTALL_UNIX,
+                        None
+                    ))
+                )
+            );
             assert!(
-                !line.contains("| bash") && line.contains(" -o $tmp && bash $tmp"),
-                "WSL 子 shell 内不能出现 curl 管道安装器: {line}"
+                !HERMES_INSTALL_UNIX.contains("| bash")
+                    && HERMES_INSTALL_UNIX.contains(" -o $tmp && bash $tmp"),
+                "WSL 子 shell 内不能出现 curl 管道安装器"
             );
         }
 
@@ -7977,6 +7988,265 @@ mod tests {
             assert!(
                 !cmd.contains("call "),
                 "Linux commands cannot use batch call: {cmd}"
+            );
+        }
+    }
+
+    mod wsl_lifecycle_auto_shell {
+        use super::super::*;
+
+        #[cfg(target_os = "windows")]
+        #[test]
+        #[ignore = "Requires real Windows/WSL and CC_SWITCH_WSL_DISTRO"]
+        fn real_wsl_auto_install_update_runs_once_with_zsh_path() {
+            use super::claude_update_wsl::{run_wsl_script_as, wsl_auto_fish_cleanup_script};
+            use std::os::windows::process::CommandExt;
+
+            let distro = std::env::var("CC_SWITCH_WSL_DISTRO").unwrap();
+            assert!(is_valid_wsl_distro_name(&distro));
+            let user = format!("ccs-fish-{}", std::process::id());
+            let home = format!("/tmp/{user}");
+            let setup = format!(
+                r#"set -eu
+command -v zsh >/dev/null
+useradd -M -d {home} -s /usr/bin/zsh {user}
+mkdir -p "{home}/npm prefix's 中文"
+cat > "{home}/npm prefix's 中文/npm" <<'CCS_NPM'
+#!/bin/sh
+printf '%s\n' "$*" >> "$CCS_CALLS"
+printf '%s' "$CCS_VALUE"
+exit "$CCS_EXIT"
+CCS_NPM
+chmod 755 "{home}/npm prefix's 中文/npm"
+printf '%s\n' "export PATH=\"{home}/npm prefix's 中文:/usr/bin:/bin\"" > {home}/.zshrc
+chown -R {user} {home}
+"#
+            );
+            let staged = run_wsl_script_as(&distro, &setup, Some("root"));
+            if !staged.status.success() {
+                panic!("fixture setup: {}", String::from_utf8_lossy(&staged.stderr));
+            }
+            let results = std::panic::catch_unwind(|| {
+                let temp = tempfile::tempdir().unwrap();
+                let bat = temp.path().join("wsl-lifecycle-auto.bat");
+                let payload = "npm i -g @openai/codex@latest";
+                // execute_directly=false is the non-Claude production call site.
+                // Both success and failure must execute the lifecycle payload once.
+                for (code, expected_calls) in [(0, 1), (42, 2)] {
+                    let line = build_wsl_tool_action_line(&distro, payload, None, None)
+                        .unwrap()
+                        .replacen(
+                            &format!("wsl.exe -d {distro} "),
+                            &format!("wsl.exe -d {distro} -u {user} "),
+                            1,
+                        );
+                    std::fs::write(
+                        &bat,
+                        format!("@echo off\r\n{line}\r\nexit /b %errorlevel%\r\n"),
+                    )
+                    .unwrap();
+                    let output = std::process::Command::new("cmd")
+                        .args(["/D", "/C"])
+                        .arg(&bat)
+                        .env("WSLENV", "CCS_CALLS:CCS_VALUE:CCS_EXIT")
+                        .env("CCS_CALLS", format!("{home}/calls"))
+                        .env("CCS_VALUE", "literal ' \" $HOME % & ! 中文")
+                        .env("CCS_EXIT", code.to_string())
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .output()
+                        .unwrap();
+                    assert_eq!(
+                        output.status.code(),
+                        Some(code),
+                        "{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert_eq!(
+                        String::from_utf8(output.stdout).unwrap(),
+                        "literal ' \" $HOME % & ! 中文"
+                    );
+                    let calls =
+                        run_wsl_script_as(&distro, &format!("cat {home}/calls"), Some("root"));
+                    assert!(calls.status.success());
+                    assert_eq!(
+                        String::from_utf8(calls.stdout).unwrap(),
+                        "i -g @openai/codex@latest\n".repeat(expected_calls)
+                    );
+                }
+            });
+            let cleaned = run_wsl_script_as(
+                &distro,
+                &wsl_auto_fish_cleanup_script(&user, &home),
+                Some("root"),
+            );
+            assert!(
+                cleaned.status.success(),
+                "fixture cleanup: {}",
+                String::from_utf8_lossy(&cleaned.stderr)
+            );
+            if let Err(panic) = results {
+                std::panic::resume_unwind(panic);
+            }
+        }
+
+        #[test]
+        fn all_auto_install_and_update_commands_initialize_user_shell() {
+            for tool in VALID_TOOLS {
+                for action in [ToolLifecycleAction::Install, ToolLifecycleAction::Update] {
+                    let payload = wsl_tool_action_shell_command(tool, action).unwrap();
+                    for flag in [None, Some("-c"), Some("-lc"), Some("-lic")] {
+                        let line =
+                            build_wsl_tool_action_line("Ubuntu", &payload, None, flag).unwrap();
+                        assert_eq!(
+                            line,
+                            format!(
+                                "wsl.exe -d Ubuntu --exec sh -c {}",
+                                windows_cmd_double_quote_arg(
+                                    &wsl_claude_update_auto_shell_command(&payload, flag)
+                                )
+                            ),
+                            "{tool} {action:?} {flag:?}"
+                        );
+                        assert_eq!(line.matches('"').count(), 2, "{tool} {action:?}");
+                        assert!(line.len() < 8191, "cmd.exe command length limit: {tool}");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn explicit_shell_and_flag_keep_existing_invocation() {
+            for shell in ["sh", "dash", "bash", "zsh", "fish", "/usr/bin/zsh"] {
+                for flag in [None, Some("-c"), Some("-lc"), Some("-lic")] {
+                    for direct in [false, true] {
+                        let line = build_wsl_tool_action_line_with_exec(
+                            "Ubuntu",
+                            "npm i -g @openai/codex@latest",
+                            Some(shell),
+                            flag,
+                            direct,
+                        )
+                        .unwrap();
+                        let shell = shell.rsplit('/').next().unwrap();
+                        let flag = flag.unwrap_or_else(|| default_flag_for_shell(shell));
+                        let execution = if direct { "--exec" } else { "--" };
+                        assert_eq!(line, format!(
+                            "wsl.exe -d Ubuntu {execution} {shell} {flag} \"npm i -g @openai/codex@latest\""
+                        ));
+                    }
+                }
+            }
+            assert!(build_wsl_tool_action_line("Ubuntu", "npm", None, Some("-c;bad")).is_err());
+            assert!(build_wsl_tool_action_line("Ubuntu-24.04", "npm", None, None).is_ok());
+            assert!(build_wsl_tool_action_line("Ubuntu;bad", "npm", None, None).is_err());
+            assert!(build_wsl_tool_action_line("Ubuntu", "npm", Some("bash;bad"), None).is_err());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn auto_payload_preserves_shell_syntax_environment_and_single_execution() {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            use std::process::Command;
+
+            let root = tempfile::tempdir().unwrap();
+            let bootstrap = root.path().join("bootstrap");
+            let prefix = root.path().join("node prefix's 中文");
+            std::fs::create_dir(&bootstrap).unwrap();
+            std::fs::create_dir(&prefix).unwrap();
+            let executable = |path: &Path, script: &str| {
+                std::fs::write(path, script).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            };
+            for name in ["sh", "base64", "id"] {
+                let found = Command::new("/bin/sh")
+                    .args(["-c", &format!("command -v {name}")])
+                    .output()
+                    .unwrap();
+                assert!(found.status.success());
+                symlink(
+                    String::from_utf8(found.stdout).unwrap().trim(),
+                    bootstrap.join(name),
+                )
+                .unwrap();
+            }
+            // A deterministic user-shell fixture supplies PATH only for initializing
+            // flags. Real fish initialization is covered by the separate opt-in test.
+            let shell = root.path().join("bash");
+            executable(
+                &shell,
+                r#"#!/bin/sh
+case "$1" in -lic|-lc) PATH="$TEST_PREFIX:$PATH"; export PATH ;; -c) ;; *) exit 98 ;; esac
+shift
+exec /bin/sh -c "$1"
+"#,
+            );
+            executable(
+                &bootstrap.join("getent"),
+                r#"#!/bin/sh
+[ "$TEST_NO_GETENT" != 1 ] || exit 1
+printf 'fixture:x:1000:1000::/fixture:%s\n' "$TEST_SHELL"
+"#,
+            );
+            executable(
+                &prefix.join("npm"),
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> "$TEST_CALLS"
+printf '%s' "$TEST_VALUE"
+exit "$TEST_EXIT"
+"#,
+            );
+            let calls = root.path().join("calls");
+            let run = |payload: &str, flag: Option<&str>, status: &str, no_getent: bool| {
+                let line = build_wsl_tool_action_line("Ubuntu", payload, None, flag).unwrap();
+                let command = line
+                    .strip_prefix("wsl.exe -d Ubuntu --exec sh -c \"")
+                    .unwrap()
+                    .strip_suffix('"')
+                    .unwrap();
+                Command::new("/bin/sh")
+                    .args(["-c", command])
+                    .env_clear()
+                    .env("PATH", &bootstrap)
+                    .env("SHELL", &shell)
+                    .env("TEST_SHELL", &shell)
+                    .env("TEST_PREFIX", &prefix)
+                    .env("TEST_CALLS", &calls)
+                    .env("TEST_VALUE", "value ' \" $HOME % & ! 中文")
+                    .env("TEST_EXIT", status)
+                    .env("TEST_NO_GETENT", if no_getent { "1" } else { "0" })
+                    .output()
+                    .unwrap()
+            };
+            let payload = "actual=$(npm i -g @openai/codex@latest) && [ \"$actual\" = \"$TEST_VALUE\" ] && printf '%s' \"$actual\"";
+            let output = run(payload, None, "0", false);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                "value ' \" $HOME % & ! 中文"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&calls).unwrap(),
+                "i -g @openai/codex@latest\n"
+            );
+
+            let output = run("npm failure", None, "42", false);
+            assert_eq!(output.status.code(), Some(42));
+            assert_eq!(
+                std::fs::read_to_string(&calls).unwrap(),
+                "i -g @openai/codex@latest\nfailure\n"
+            );
+
+            let output = run("npm fallback", Some("-lc"), "0", true);
+            assert!(output.status.success());
+            let output = run("npm must-not-run", Some("-c"), "0", false);
+            assert_eq!(output.status.code(), Some(127));
+            assert_eq!(
+                std::fs::read_to_string(&calls).unwrap(),
+                "i -g @openai/codex@latest\nfailure\nfallback\n"
             );
         }
     }
@@ -8366,7 +8636,7 @@ printf 'all automatic fish update cases passed\n'
         }
 
         #[cfg(target_os = "windows")]
-        fn run_wsl_script_as(distro: &str, script: &str, user: Option<&str>) -> Output {
+        pub(super) fn run_wsl_script_as(distro: &str, script: &str, user: Option<&str>) -> Output {
             use std::io::Write;
             use std::os::windows::process::CommandExt;
             use std::process::Stdio;
@@ -8510,7 +8780,10 @@ printf 'all automatic fish update cases passed\n'
         #[cfg(target_os = "windows")]
         // WSL can retain this test user's systemd sessions after the command
         // exits. Drain only that account before deleting it; keep failures strict.
-        fn wsl_auto_fish_cleanup_script(fixture_user: &str, fixture_home: &str) -> String {
+        pub(super) fn wsl_auto_fish_cleanup_script(
+            fixture_user: &str,
+            fixture_home: &str,
+        ) -> String {
             let script = r#"set -eu
 fixture_user=__CCS_USER__
 fixture_home=__CCS_HOME__
