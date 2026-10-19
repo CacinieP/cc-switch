@@ -1,13 +1,10 @@
-name: CI
+name: WSL extension validation
 
 on:
   pull_request:
-    branches: [main]
+    branches: [qa/wsl-auto-shell-20261019]
   push:
-    branches: [main]
-  # 每周一次全量：push 到 main 也按路径过滤后，靠它在缓存被淘汰后重新建起来
-  schedule:
-    - cron: "41 19 * * 0" # 周一 03:41（北京时间）
+    branches: [qa/wsl-auto-shell-20261019]
   workflow_dispatch:
 
 concurrency:
@@ -142,7 +139,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          sudo apt-get install -y --no-install-recommends fish \
             build-essential pkg-config libssl-dev \
             libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev
           sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev \
@@ -177,6 +174,10 @@ jobs:
       # ignored，nextest 不跑 doctest 也不漏。
       - name: Run tests
         run: cargo nextest run --manifest-path src-tauri/Cargo.toml --profile ci
+
+      - name: Run real fish initialization fixture
+        if: runner.os == 'Linux'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib commands::misc::tests::claude_update_wsl::wsl_auto_fish_initializes_custom_prefix -- --ignored --exact --nocapture
 
   backend-windows-wsl2:
     name: Backend Checks (Windows + WSL2 home)
@@ -226,7 +227,7 @@ jobs:
       - name: Prepare WSL2-backed test environment
         shell: pwsh
         run: |
-          wsl.exe -d Ubuntu-24.04 -u root --exec sh -c "apt-get update -qq && apt-get install -y -qq fish"
+          wsl.exe -d Ubuntu-24.04 -u root --exec sh -c "apt-get update -qq && apt-get install -y -qq fish zsh"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           wsl.exe -d Ubuntu-24.04 -- bash -lc "rm -rf /tmp/cc-switch-windows-test-root && mkdir -p /tmp/cc-switch-windows-test-root/{home,temp} && chmod -R 0777 /tmp/cc-switch-windows-test-root"
           $testRoot = "\\wsl.localhost\Ubuntu-24.04\tmp\cc-switch-windows-test-root"
@@ -321,5 +322,19 @@ jobs:
           $testList = & $env:CC_SWITCH_TEST_EXE --list --ignored
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($testList -notcontains "${testName}: test") { throw "Hermes WSL test not discovered" }
+          & $env:CC_SWITCH_TEST_EXE $testName --ignored --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run WSL2 automatic lifecycle extension regression
+        env:
+          CC_SWITCH_WSL_DISTRO: Ubuntu-24.04
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+        shell: pwsh
+        run: |
+          $testName = "commands::misc::tests::wsl_lifecycle_auto_shell::real_wsl_auto_install_update_runs_once_with_zsh_path"
+          $testList = & $env:CC_SWITCH_TEST_EXE --list --ignored
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($testList -notcontains "${testName}: test") { throw "Extension WSL test not discovered" }
           & $env:CC_SWITCH_TEST_EXE $testName --ignored --exact --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
